@@ -1,0 +1,9 @@
+[project]
+name = "multi-llm-debate"
+version = "1.0.0"
+description = "Multi-agent round table discussion platform"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["unit_test"]

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/build/
+
+# Built frontend served by backend
+backend/static/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.sqlite3
+
+# Alembic
+backend/alembic/versions/__pycache__/
+
+# Temp
+temp/
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
