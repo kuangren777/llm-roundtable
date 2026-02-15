@@ -1,5 +1,5 @@
-import { useState, useRef } from 'react'
-import { createDiscussion, uploadMaterials } from '../services/api'
+import { useState, useRef, useEffect } from 'react'
+import { createDiscussion, uploadMaterials, listLLMProviders } from '../services/api'
 
 const MODE_OPTIONS = [
   { value: 'auto', label: '自动 (Auto)', desc: '由 LLM 分析话题，动态生成最优专家组合' },
@@ -14,9 +14,9 @@ const ALLOWED_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp']
 
 function makeDefaultAgents() {
   return [
-    { name: '主持人', role: 'host', persona: '经验丰富的圆桌会议主持人', provider: 'openai', model: 'gpt-4o', api_key: '', base_url: '' },
-    { name: '专家A', role: 'panelist', persona: '', provider: 'openai', model: 'gpt-4o', api_key: '', base_url: '' },
-    { name: '批评家', role: 'critic', persona: '严谨的分析批评家', provider: 'openai', model: 'gpt-4o', api_key: '', base_url: '' },
+    { name: '主持人', role: 'host', persona: '经验丰富的圆桌会议主持人', provider: 'openai', model: 'gpt-4o' },
+    { name: '专家A', role: 'panelist', persona: '', provider: 'openai', model: 'gpt-4o' },
+    { name: '批评家', role: 'critic', persona: '严谨的分析批评家', provider: 'openai', model: 'gpt-4o' },
   ]
 }
 
@@ -44,8 +44,33 @@ export default function CreatePage({ onCreated }) {
   const [maxRounds, setMaxRounds] = useState(3)
   const [agents, setAgents] = useState(makeDefaultAgents)
 
+  // LLM provider/model state
+  const [providers, setProviders] = useState([])
+  const [allModels, setAllModels] = useState([])  // flattened: { id, model, providerName, provider }
+  const [selectedModelIds, setSelectedModelIds] = useState(new Set())
+  const [hostModelId, setHostModelId] = useState(null)
+
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
+
+  // Load providers when modal opens
+  useEffect(() => {
+    if (!showModal) return
+    listLLMProviders().then(provs => {
+      setProviders(provs)
+      const flat = []
+      for (const p of provs) {
+        for (const m of (p.models || [])) {
+          flat.push({ id: m.id, model: m.model, providerName: p.name, provider: p.provider })
+        }
+      }
+      setAllModels(flat)
+      // Auto-select all models by default
+      const ids = new Set(flat.map(m => m.id))
+      setSelectedModelIds(ids)
+      if (flat.length > 0 && !hostModelId) setHostModelId(flat[0].id)
+    }).catch(() => {})
+  }, [showModal])
 
   // --- File handling ---
   const addFiles = (newFiles) => {
@@ -56,7 +81,6 @@ export default function CreatePage({ onCreated }) {
       const isFile = ALLOWED_FILE_EXTS.includes(ext)
       if (!isImage && !isFile) continue
       if (file.size > 10 * 1024 * 1024) continue
-      // Avoid duplicates
       if (files.some(f => f.file.name === file.name && f.file.size === file.size)) continue
       const item = { file }
       if (isImage) {
@@ -99,18 +123,59 @@ export default function CreatePage({ onCreated }) {
     setShowModal(true)
   }
 
+  // --- Model selection helpers ---
+  const toggleModel = (id) => {
+    setSelectedModelIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) {
+        next.delete(id)
+        // If we deselected the host model, pick another
+        if (hostModelId === id) {
+          const remaining = allModels.filter(m => next.has(m.id))
+          setHostModelId(remaining.length > 0 ? remaining[0].id : null)
+        }
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
+
+  const selectAllModels = () => {
+    setSelectedModelIds(new Set(allModels.map(m => m.id)))
+  }
+
+  const deselectAllModels = () => {
+    setSelectedModelIds(new Set())
+    setHostModelId(null)
+  }
+
   // --- Custom mode agent helpers ---
   const updateAgent = (idx, field, value) => {
     setAgents(prev => prev.map((a, i) => i === idx ? { ...a, [field]: value } : a))
   }
-  const addAgent = () => setAgents(prev => [...prev, { name: '', role: 'panelist', persona: '', provider: 'openai', model: 'gpt-4o', api_key: '', base_url: '' }])
+  const addAgent = () => setAgents(prev => [...prev, { name: '', role: 'panelist', persona: '', provider: 'openai', model: 'gpt-4o' }])
   const removeAgent = (idx) => {
     if (agents.length <= 2) return
     setAgents(prev => prev.filter((_, i) => i !== idx))
   }
 
+  // Build provider→models map for custom mode dropdowns
+  const providerModels = {}
+  for (const p of providers) {
+    const key = p.provider
+    if (!providerModels[key]) providerModels[key] = { name: p.name, models: [], api_key: p.api_key, base_url: p.base_url }
+    for (const m of (p.models || [])) {
+      providerModels[key].models.push(m.model)
+    }
+  }
+
   // --- Final submit ---
   const handleSubmit = async () => {
+    if (mode !== 'custom' && selectedModelIds.size === 0) {
+      setError('请至少选择一个模型')
+      return
+    }
     if (mode === 'custom') {
       if (!agents.some(a => a.role === 'host')) { setError('自定义模式至少需要一个主持人'); return }
       if (!agents.some(a => a.role === 'panelist')) { setError('自定义模式至少需要一个专家'); return }
@@ -124,16 +189,25 @@ export default function CreatePage({ onCreated }) {
 
     try {
       const data = { topic: topic.trim(), mode, max_rounds: maxRounds }
+
+      if (mode !== 'custom') {
+        data.selected_model_ids = [...selectedModelIds]
+        if (hostModelId) data.host_model_id = hostModelId
+      }
+
       if (mode === 'custom') {
-        data.agents = agents.map(a => ({
-          name: a.name.trim(),
-          role: a.role,
-          persona: a.persona.trim() || null,
-          provider: a.provider.trim() || 'openai',
-          model: a.model.trim() || 'gpt-4o',
-          api_key: a.api_key.trim() || null,
-          base_url: a.base_url.trim() || null,
-        }))
+        data.agents = agents.map(a => {
+          const prov = providers.find(p => p.provider === a.provider)
+          return {
+            name: a.name.trim(),
+            role: a.role,
+            persona: a.persona.trim() || null,
+            provider: a.provider.trim() || 'openai',
+            model: a.model.trim() || 'gpt-4o',
+            api_key: prov?.api_key || null,
+            base_url: prov?.base_url || null,
+          }
+        })
       }
 
       const result = await createDiscussion(data)
@@ -281,7 +355,58 @@ export default function CreatePage({ onCreated }) {
                 />
               </div>
 
-              {/* Custom mode: agent config */}
+              {/* Model selection — for non-custom modes */}
+              {mode !== 'custom' && (
+                <div className="form-section">
+                  <div className="section-header">
+                    <label className="form-label">参与模型</label>
+                    <div className="section-actions">
+                      <button type="button" className="btn btn-sm" onClick={selectAllModels}>全选</button>
+                      <button type="button" className="btn btn-sm" onClick={deselectAllModels}>清空</button>
+                    </div>
+                  </div>
+                  {allModels.length === 0 ? (
+                    <p style={{ fontSize: 13, color: 'var(--text-dim)' }}>
+                      暂无注册模型，请先在「设置」中添加 LLM 供应商和模型
+                    </p>
+                  ) : (
+                    <div className="model-select-list">
+                      {allModels.map(m => (
+                        <label key={m.id} className={`model-select-item ${selectedModelIds.has(m.id) ? 'selected' : ''}`}>
+                          <input
+                            type="checkbox"
+                            checked={selectedModelIds.has(m.id)}
+                            onChange={() => toggleModel(m.id)}
+                          />
+                          <span className="model-select-provider">{m.providerName}</span>
+                          <span className="model-select-name">{m.model}</span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Host model selector */}
+                  {selectedModelIds.size > 0 && (
+                    <div className="form-group" style={{ marginTop: 12 }}>
+                      <label className="form-label-sm">主持模型</label>
+                      <select
+                        className="form-select"
+                        value={hostModelId || ''}
+                        onChange={e => setHostModelId(Number(e.target.value))}
+                      >
+                        {allModels.filter(m => selectedModelIds.has(m.id)).map(m => (
+                          <option key={m.id} value={m.id}>{m.providerName} / {m.model}</option>
+                        ))}
+                      </select>
+                      <p style={{ fontSize: 12, color: 'var(--text-dim)', marginTop: 4 }}>
+                        主持人将使用此模型进行规划和总结
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Custom mode: agent config with model dropdowns */}
               {mode === 'custom' && (
                 <div className="form-section">
                   <div className="section-header">
@@ -319,11 +444,40 @@ export default function CreatePage({ onCreated }) {
                           <div className="form-row">
                             <div className="form-group">
                               <label>供应商</label>
-                              <input className="form-input" value={agent.provider} onChange={e => updateAgent(idx, 'provider', e.target.value)} placeholder="openai" />
+                              <select
+                                className="form-select"
+                                value={agent.provider}
+                                onChange={e => {
+                                  const newProv = e.target.value
+                                  updateAgent(idx, 'provider', newProv)
+                                  const models = providerModels[newProv]?.models || []
+                                  if (models.length > 0 && !models.includes(agent.model)) {
+                                    updateAgent(idx, 'model', models[0])
+                                  }
+                                }}
+                              >
+                                {Object.entries(providerModels).map(([key, val]) => (
+                                  <option key={key} value={key}>{val.name} ({key})</option>
+                                ))}
+                                {!providerModels[agent.provider] && (
+                                  <option value={agent.provider}>{agent.provider}</option>
+                                )}
+                              </select>
                             </div>
                             <div className="form-group">
                               <label>模型</label>
-                              <input className="form-input" value={agent.model} onChange={e => updateAgent(idx, 'model', e.target.value)} placeholder="gpt-4o" />
+                              <select
+                                className="form-select"
+                                value={agent.model}
+                                onChange={e => updateAgent(idx, 'model', e.target.value)}
+                              >
+                                {(providerModels[agent.provider]?.models || []).map(m => (
+                                  <option key={m} value={m}>{m}</option>
+                                ))}
+                                {!(providerModels[agent.provider]?.models || []).includes(agent.model) && (
+                                  <option value={agent.model}>{agent.model}</option>
+                                )}
+                              </select>
                             </div>
                           </div>
                         </div>

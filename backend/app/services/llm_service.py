@@ -93,6 +93,8 @@ async def call_llm_stream(
     chunks = []
     total_chars = 0
     async for chunk in stream:
+        if not chunk.choices:
+            continue  # some providers send empty choices on first/last chunk
         delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
         if delta:
             chunks.append(delta)

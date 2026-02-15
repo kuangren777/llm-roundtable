@@ -117,6 +117,8 @@ class DiscussionCreate(BaseModel):
     mode: DiscussionMode = DiscussionMode.AUTO
     max_rounds: int = Field(default=3, ge=1, le=10)
     agents: Optional[list[AgentConfigCreate]] = None  # Only used in Custom mode
+    selected_model_ids: Optional[list[int]] = None  # Filter to specific LLMModel IDs
+    host_model_id: Optional[int] = None  # Explicit model for the host agent
 
 
 class MessageResponse(BaseModel):

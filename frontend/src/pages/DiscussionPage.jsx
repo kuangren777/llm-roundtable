@@ -159,8 +159,8 @@ export default function DiscussionPage({ discussionId }) {
             </span>
           )}
           {status === 'ready' && (
-            <button className="btn btn-primary" onClick={startDiscussion}>
-              开始讨论
+            <button className="btn btn-primary" onClick={startDiscussion} disabled={preparingAgents}>
+              {preparingAgents ? '准备中...' : '开始讨论'}
             </button>
           )}
           {status === 'error' && (

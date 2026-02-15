@@ -34,15 +34,28 @@ async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discuss
         .order_by(LLMProvider.created_at)
     )
     providers = list(result.scalars().all())
-    llm_configs_raw = []
+
+    # Build model ID → config lookup
+    all_models = {}
     for p in providers:
         for m in p.models:
-            llm_configs_raw.append({
+            all_models[m.id] = {
                 "provider": p.provider,
                 "model": m.model,
                 "api_key": p.api_key,
                 "base_url": p.base_url,
-            })
+            }
+
+    # Filter to selected models if specified, otherwise use all
+    if data.selected_model_ids:
+        llm_configs_raw = [all_models[mid] for mid in data.selected_model_ids if mid in all_models]
+    else:
+        llm_configs_raw = list(all_models.values())
+
+    # Put host model first so round-robin assigns it to the host agent
+    if data.host_model_id and data.host_model_id in all_models:
+        host_cfg = all_models[data.host_model_id]
+        llm_configs_raw = [host_cfg] + [c for c in llm_configs_raw if c is not host_cfg]
 
     discussion = Discussion(
         topic=data.topic,
@@ -129,7 +142,11 @@ async def update_agent(db: AsyncSession, discussion_id: int, agent_id: int, data
 
 
 async def prepare_agents(db: AsyncSession, discussion_id: int) -> list[AgentConfig]:
-    """Pre-generate agents for non-custom modes so the user can edit them before running."""
+    """Pre-generate agents for non-custom modes so the user can edit them before running.
+
+    Guards against concurrent calls (e.g. React strict mode double-firing)
+    by re-checking after resolve completes.
+    """
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
         return []
@@ -137,6 +154,12 @@ async def prepare_agents(db: AsyncSession, discussion_id: int) -> list[AgentConf
         return list(discussion.agents)
 
     agent_defs = await _resolve_agents(discussion)
+
+    # Re-check after async resolve to prevent TOCTOU race
+    await db.refresh(discussion, ["agents"])
+    if discussion.agents:
+        return list(discussion.agents)
+
     agents = []
     for ad in agent_defs:
         agent = AgentConfig(
@@ -340,21 +363,10 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
     # Resolve agents if not yet generated (non-custom modes)
     if not discussion.agents:
         yield DiscussionEvent(event_type="phase_change", phase="planning", content="正在生成专家团队...")
-        agent_defs = await _resolve_agents(discussion)
-        # Save generated agents to DB
-        for ad in agent_defs:
-            agent = AgentConfig(
-                discussion_id=discussion.id,
-                name=ad["name"],
-                role=ad["role"],
-                persona=ad.get("persona", ""),
-                provider=ad.get("provider", "openai"),
-                model=ad.get("model", "gpt-4o"),
-                api_key=ad.get("api_key"),
-                base_url=ad.get("base_url"),
-            )
-            db.add(agent)
-        await db.commit()
+        agents_list = await prepare_agents(db, discussion_id)
+        if not agents_list:
+            yield DiscussionEvent(event_type="error", content="No agents available for discussion")
+            return
         await db.refresh(discussion, ["agents"])
 
     # Build agent info list
