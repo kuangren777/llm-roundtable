@@ -537,13 +537,19 @@ function CopyButton({ text }) {
 
 function MessageBubble({ msg }) {
   const role = msg.agent_role || 'panelist'
-  const [expanded, setExpanded] = useState(true)
+  const isLong = (msg.content || '').length >= 200
+  const hasSummary = !!msg.summary
+  // Collapse by default only when a summary exists; otherwise show full content
+  const [expanded, setExpanded] = useState(!hasSummary)
 
   const roleIcon = { host: '🎯', critic: '🔍', panelist: '💡', user: '👤' }
 
+  // Show summary when collapsed + summary available, otherwise full content
+  const displayText = !expanded && hasSummary ? msg.summary : msg.content
+
   return (
     <div className={`message-bubble role-${role}`}>
-      <div className="message-header" onClick={() => setExpanded(v => !v)}>
+      <div className="message-header" onClick={() => isLong && setExpanded(v => !v)}>
         <span className="message-agent">
           <span className={`role-icon role-icon-${role}`}>
             {roleIcon[role] || '💡'}
@@ -553,14 +559,17 @@ function MessageBubble({ msg }) {
         <span className="message-meta">
           {PHASE_LABELS[msg.phase] || msg.phase}
           {msg.round_number !== undefined && role !== 'user' && ` · 第${msg.round_number + 1}轮`}
+          {isLong && (
+            <span className="expand-toggle">
+              {expanded ? '收起' : '展开'}
+            </span>
+          )}
         </span>
       </div>
-      {expanded && (
-        <div className="message-content">
-          {msg.content}
-          <CopyButton text={msg.content} />
-        </div>
-      )}
+      <div className={`message-content ${!expanded ? 'collapsed' : ''}`}>
+        {displayText}
+        <CopyButton text={msg.content} />
+      </div>
     </div>
   )
 }

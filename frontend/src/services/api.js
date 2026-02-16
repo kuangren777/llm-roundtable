@@ -162,6 +162,24 @@ export async function submitUserInput(discussionId, content) {
   return res.json()
 }
 
+// --- System Settings APIs ---
+
+export async function getSystemSetting(key) {
+  const res = await fetch(`${API_BASE}/settings/${key}`)
+  if (!res.ok) throw new Error(`Failed to get setting: ${res.statusText}`)
+  return res.json()
+}
+
+export async function setSystemSetting(key, value) {
+  const res = await fetch(`${API_BASE}/settings/${key}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value }),
+  })
+  if (!res.ok) throw new Error(`Failed to save setting: ${res.statusText}`)
+  return res.json()
+}
+
 export async function streamDiscussion(id, onEvent, onError, onComplete) {
   const controller = new AbortController()
 

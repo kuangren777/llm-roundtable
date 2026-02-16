@@ -133,9 +133,15 @@ class MessageResponse(BaseModel):
     agent_name: str
     agent_role: AgentRole
     content: str
+    summary: Optional[str] = None
     round_number: int
     phase: Optional[str]
     created_at: datetime
+
+
+class SystemSettingResponse(BaseModel):
+    key: str
+    value: Optional[str] = None
 
 
 class DiscussionResponse(BaseModel):

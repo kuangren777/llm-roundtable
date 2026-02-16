@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import {
   listLLMProviders, addLLMProvider, updateLLMProvider, deleteLLMProvider,
   addLLMModel, updateLLMModel, deleteLLMModel,
+  getSystemSetting, setSystemSetting,
 } from '../services/api'
 
 const PROVIDER_PRESETS = [
@@ -19,6 +20,11 @@ export default function SettingsPage() {
   const [error, setError] = useState(null)
   const [adding, setAdding] = useState(false)
 
+  // Summary model config
+  const [summaryConfig, setSummaryConfig] = useState(null) // { provider_id, model }
+  const [summaryDirty, setSummaryDirty] = useState(false)
+  const [savingSummary, setSavingSummary] = useState(false)
+
   // Add provider form
   const [form, setForm] = useState({ name: '', provider: '', api_key: '', base_url: '' })
 
@@ -29,8 +35,16 @@ export default function SettingsPage() {
   const [newModel, setNewModel] = useState({ model: '', name: '' })
 
   useEffect(() => {
-    listLLMProviders()
-      .then(setProviders)
+    Promise.all([
+      listLLMProviders(),
+      getSystemSetting('summary_model'),
+    ])
+      .then(([provs, setting]) => {
+        setProviders(provs)
+        if (setting.value) {
+          try { setSummaryConfig(JSON.parse(setting.value)) } catch {}
+        }
+      })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }, [])
@@ -163,6 +177,29 @@ export default function SettingsPage() {
     }
   }
 
+  const handleSaveSummaryModel = async () => {
+    setSavingSummary(true)
+    setError(null)
+    try {
+      await setSystemSetting('summary_model', summaryConfig)
+      setSummaryDirty(false)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setSavingSummary(false)
+    }
+  }
+
+  // Build flat list of all provider+model combos for the summary model dropdown
+  const allModelOptions = providers.flatMap(p =>
+    p.models.map(m => ({
+      provider_id: p.id,
+      provider: p.provider,
+      model: m.model,
+      label: `${p.name} / ${m.name || m.model}`,
+    }))
+  )
+
   return (
     <div className="settings-page">
       <h1>全局 LLM 设置</h1>
@@ -171,6 +208,48 @@ export default function SettingsPage() {
       </p>
 
       {error && <div className="error-msg">{error}</div>}
+
+      {/* Summary model selector */}
+      <div className="settings-add-card" style={{ marginBottom: 24 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>消息总结模型</div>
+        <p style={{ color: 'var(--text-dim)', fontSize: 13, marginBottom: 12 }}>
+          选择用于自动总结讨论消息的模型，长消息将自动生成摘要并折叠显示
+        </p>
+        <div className="form-row" style={{ alignItems: 'flex-end' }}>
+          <div className="form-group" style={{ flex: 1 }}>
+            <label>总结模型</label>
+            <select
+              className="form-select"
+              value={summaryConfig ? `${summaryConfig.provider_id}:${summaryConfig.model}` : ''}
+              onChange={e => {
+                if (!e.target.value) {
+                  setSummaryConfig(null)
+                  setSummaryDirty(true)
+                  return
+                }
+                const opt = allModelOptions.find(o => `${o.provider_id}:${o.model}` === e.target.value)
+                if (opt) {
+                  setSummaryConfig({ provider_id: opt.provider_id, provider: opt.provider, model: opt.model })
+                  setSummaryDirty(true)
+                }
+              }}
+            >
+              <option value="">未设置 (不自动总结)</option>
+              {allModelOptions.map(o => (
+                <option key={`${o.provider_id}:${o.model}`} value={`${o.provider_id}:${o.model}`}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          {summaryDirty && (
+            <button className="btn btn-primary btn-sm" onClick={handleSaveSummaryModel} disabled={savingSummary}
+              style={{ marginBottom: 4 }}>
+              {savingSummary ? '保存中...' : '保存'}
+            </button>
+          )}
+        </div>
+      </div>
 
       {/* Add provider form */}
       <div className="settings-add-card">

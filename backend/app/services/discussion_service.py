@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 from fastapi import UploadFile
 
-from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole
+from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole, SystemSetting
 from ..schemas.schemas import DiscussionCreate, AgentConfigUpdate, DiscussionEvent
 from ..database import async_session
 from .discussion_engine import build_discussion_graph, AgentInfo, DiscussionState, progress_queue_var, _pending_user_messages
@@ -34,6 +34,66 @@ UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 ALLOWED_FILE_EXTS = {".txt", ".md", ".pdf", ".docx"}
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# Minimum content length to trigger summarization (short messages don't need it)
+MIN_SUMMARY_LENGTH = 200
+
+
+async def _get_summary_model_config() -> dict | None:
+    """Read the summary_model system setting. Returns dict with provider/model/api_key/base_url or None."""
+    async with async_session() as db:
+        result = await db.execute(
+            select(SystemSetting).where(SystemSetting.key == "summary_model")
+        )
+        setting = result.scalar_one_or_none()
+        if not setting or not setting.value:
+            return None
+        try:
+            cfg = json.loads(setting.value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        # Resolve api_key/base_url from provider table
+        provider_id = cfg.get("provider_id")
+        if provider_id:
+            prov_result = await db.execute(
+                select(LLMProvider).where(LLMProvider.id == provider_id)
+            )
+            prov = prov_result.scalar_one_or_none()
+            if prov:
+                cfg["api_key"] = prov.api_key
+                cfg["base_url"] = prov.base_url
+                cfg["provider"] = prov.provider
+        return cfg
+
+
+async def _summarize_message_bg(message_id: int):
+    """Background task: generate a summary for a message using the configured summary model."""
+    try:
+        cfg = await _get_summary_model_config()
+        if not cfg:
+            return
+
+        async with async_session() as db:
+            result = await db.execute(select(Message).where(Message.id == message_id))
+            msg = result.scalar_one_or_none()
+            if not msg or msg.summary:
+                return
+            if len(msg.content) < MIN_SUMMARY_LENGTH:
+                return
+
+            summary = await call_llm(
+                provider=cfg.get("provider", "openai"),
+                model=cfg.get("model", "gpt-4o-mini"),
+                messages=[{"role": "user", "content": f"请用2-3句话简洁总结以下内容，保留关键观点，不要添加额外评论：\n\n{msg.content}"}],
+                api_key=cfg.get("api_key"),
+                base_url=cfg.get("base_url"),
+                temperature=0.3,
+                max_tokens=200,
+            )
+            msg.summary = summary.strip()
+            await db.commit()
+    except Exception as e:
+        logger.warning("Failed to summarize message %d: %s", message_id, e)
 
 
 async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discussion:
@@ -550,6 +610,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
 
                 # Save messages to DB and yield events
                 new_messages = node_output.get("messages", [])
+                saved_msgs = []
                 for msg_data in new_messages:
                     msg = Message(
                         discussion_id=discussion.id,
@@ -560,6 +621,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                         phase=msg_data.get("phase", ""),
                     )
                     db.add(msg)
+                    saved_msgs.append(msg)
 
                     yield DiscussionEvent(
                         event_type="message",
@@ -579,6 +641,11 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
 
                 discussion.current_round = node_output.get("current_round", discussion.current_round)
                 await db.commit()
+
+                # Fire background summarization for saved messages
+                for msg in saved_msgs:
+                    if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
+                        asyncio.create_task(_summarize_message_bg(msg.id))
 
         discussion.status = DiscussionStatus.WAITING_INPUT
         await db.commit()
@@ -665,21 +732,29 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     elif phase == "synthesizing":
                         discussion.status = DiscussionStatus.SYNTHESIZING
 
+                    saved_msgs = []
                     for msg_data in node_output.get("messages", []):
-                        db.add(Message(
+                        msg = Message(
                             discussion_id=discussion_id,
                             agent_name=msg_data["agent_name"],
                             agent_role=msg_data["agent_role"],
                             content=msg_data["content"],
                             round_number=msg_data.get("round_number", 0),
                             phase=msg_data.get("phase", ""),
-                        ))
+                        )
+                        db.add(msg)
+                        saved_msgs.append(msg)
 
                     if node_output.get("final_summary"):
                         discussion.final_summary = node_output["final_summary"]
 
                     discussion.current_round = node_output.get("current_round", discussion.current_round)
                     await db.commit()
+
+                    # Fire background summarization
+                    for msg in saved_msgs:
+                        if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
+                            asyncio.create_task(_summarize_message_bg(msg.id))
 
             # Graph finished — set final status
             discussion.status = DiscussionStatus.WAITING_INPUT

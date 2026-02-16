@@ -118,8 +118,17 @@ class Message(Base):
     agent_name = Column(String(100), nullable=False)
     agent_role = Column(SAEnum(AgentRole), nullable=False)
     content = Column(Text, nullable=False)
+    summary = Column(Text, nullable=True)
     round_number = Column(Integer, default=0)
     phase = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     discussion = relationship("Discussion", back_populates="messages")
+
+
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

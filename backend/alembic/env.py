@@ -8,7 +8,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.database import Base
-from app.models.models import Discussion, AgentConfig, Message, DiscussionMaterial  # noqa: F401
+from app.models.models import Discussion, AgentConfig, Message, DiscussionMaterial, SystemSetting  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:
