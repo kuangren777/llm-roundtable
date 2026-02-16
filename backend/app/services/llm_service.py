@@ -3,12 +3,16 @@
 Provider type and base_url are configured by the user in Settings.
 We just pass them through to the openai SDK.
 """
+import asyncio
 import logging
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 7
+BASE_DELAY = 1.0  # seconds
 
 
 def _normalize_base_url(url: Optional[str]) -> Optional[str]:
@@ -37,8 +41,9 @@ async def call_llm(
     base_url: Optional[str] = None,
     temperature: float = 0.7,
     timeout: float = 180,
+    **kwargs,
 ) -> str:
-    """Call an LLM via the OpenAI-compatible chat completions API."""
+    """Call an LLM via the OpenAI-compatible chat completions API with retry."""
     normalized_url = _normalize_base_url(base_url)
     client = AsyncOpenAI(
         api_key=api_key or "sk-placeholder",
@@ -46,23 +51,39 @@ async def call_llm(
         timeout=timeout,
     )
 
-    response = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-    )
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            create_kwargs = dict(model=model, messages=messages, temperature=temperature)
+            if "max_tokens" in kwargs:
+                create_kwargs["max_tokens"] = kwargs["max_tokens"]
+            response = await client.chat.completions.create(**create_kwargs)
 
-    # Some OpenAI-compatible endpoints return raw strings (e.g. HTML error pages)
-    if isinstance(response, str):
-        if "<html" in response.lower() or "<!doctype" in response.lower():
-            raise ValueError(
-                f"Provider {provider}/{model} returned an HTML page instead of a JSON response. "
-                f"Check that the base_url is correct (got: {base_url})."
-            )
-        logger.warning("Provider %s/%s returned raw string instead of ChatCompletion", provider, model)
-        return response
+            # Some OpenAI-compatible endpoints return raw strings (e.g. HTML error pages)
+            if isinstance(response, str):
+                if "<html" in response.lower() or "<!doctype" in response.lower():
+                    raise ValueError(
+                        f"Provider {provider}/{model} returned an HTML page instead of a JSON response. "
+                        f"Check that the base_url is correct (got: {base_url})."
+                    )
+                logger.warning("Provider %s/%s returned raw string instead of ChatCompletion", provider, model)
+                return response
 
-    return response.choices[0].message.content
+            return response.choices[0].message.content
+
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                delay = BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "LLM call %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                    provider, model, attempt + 1, MAX_RETRIES, e, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error("LLM call %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
+
+    raise last_error
 
 
 async def call_llm_stream(
@@ -75,7 +96,7 @@ async def call_llm_stream(
     on_chunk=None,  # async callback(chunk_text: str, total_chars: int)
     timeout: float = 180,
 ) -> tuple[str, int]:
-    """Streaming LLM call with on_chunk progress callback. Returns (full_text, total_chars)."""
+    """Streaming LLM call with retry + on_chunk progress callback. Returns (full_text, total_chars)."""
     normalized_url = _normalize_base_url(base_url)
     client = AsyncOpenAI(
         api_key=api_key or "sk-placeholder",
@@ -83,23 +104,40 @@ async def call_llm_stream(
         timeout=timeout,
     )
 
-    stream = await client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        stream=True,
-    )
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                stream=True,
+            )
 
-    chunks = []
-    total_chars = 0
-    async for chunk in stream:
-        if not chunk.choices:
-            continue  # some providers send empty choices on first/last chunk
-        delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
-        if delta:
-            chunks.append(delta)
-            total_chars += len(delta)
-            if on_chunk:
-                await on_chunk(delta, total_chars)
+            chunks = []
+            total_chars = 0
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
+                if delta:
+                    chunks.append(delta)
+                    total_chars += len(delta)
+                    if on_chunk:
+                        await on_chunk(delta, total_chars)
 
-    return "".join(chunks), total_chars
+            return "".join(chunks), total_chars
+
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                delay = BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "LLM stream %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                    provider, model, attempt + 1, MAX_RETRIES, e, delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error("LLM stream %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
+
+    raise last_error

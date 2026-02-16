@@ -1011,6 +1011,25 @@ a { color: inherit; text-decoration: none; }
   animation: none;
 }
 
+.phase-indicator.completed .phase-dot {
+  background: var(--success);
+  animation: none;
+}
+
+/* Polling mode banner */
+.polling-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: rgba(99, 102, 241, 0.08);
+  border: 1px solid rgba(99, 102, 241, 0.2);
+  border-radius: var(--radius);
+  font-size: 13px;
+  color: var(--text-dim);
+  margin-bottom: 12px;
+}
+
 /* === Responsive === */
 @media (max-width: 768px) {
   .app-layout { flex-direction: column; }

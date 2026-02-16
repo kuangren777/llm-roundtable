@@ -248,6 +248,12 @@ export default function DiscussionPage({ discussionId }) {
               等待输入
             </span>
           )}
+          {status === 'completed' && (
+            <span className="phase-indicator completed">
+              <span className="phase-dot" />
+              已完成
+            </span>
+          )}
           {(status === 'ready' || status === 'error') && (
             <button className="btn btn-primary" onClick={() => {
               setMessages([])
@@ -298,6 +304,14 @@ export default function DiscussionPage({ discussionId }) {
                 <span className="agent-model">{a.provider}/{a.model}</span>
               </span>
             ))}
+          </div>
+        )}
+
+        {/* Polling mode banner — after page refresh, no SSE progress available */}
+        {status === 'running' && pollRef.current && !llmProgress && (
+          <div className="polling-banner">
+            <span className="phase-dot pulse" />
+            后台运行中 · {PHASE_LABELS[phase] || phase || '处理中'} · 每 2.5 秒刷新
           </div>
         )}
 
