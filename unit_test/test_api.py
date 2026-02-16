@@ -330,3 +330,80 @@ async def test_discussion_snapshots_provider_models(client):
     detail = await client.get(f"/api/discussions/{disc_id}")
     assert detail.status_code == 200
     assert detail.json()["mode"] == "debate"
+
+
+async def test_user_input_cycle_index_increments_after_completion(client):
+    create_res = await client.post("/api/discussions/", json={"topic": "Cycle test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    first = await client.post(f"/api/discussions/{disc_id}/user-input", json={"content": "第一条输入"})
+    assert first.status_code == 200
+
+    complete_res = await client.post(f"/api/discussions/{disc_id}/complete")
+    assert complete_res.status_code == 200
+
+    second = await client.post(f"/api/discussions/{disc_id}/user-input", json={"content": "第二条输入"})
+    assert second.status_code == 200
+
+    detail = await client.get(f"/api/discussions/{disc_id}")
+    assert detail.status_code == 200
+    user_msgs = [m for m in detail.json()["messages"] if m["agent_role"] == "user"]
+    assert len(user_msgs) == 2
+    assert user_msgs[0]["cycle_index"] == 0
+    assert user_msgs[1]["cycle_index"] == 1
+
+
+# --- Observer tests ---
+
+async def test_observer_history_empty(client):
+    """New discussion should have no observer history."""
+    create_res = await client.post("/api/discussions/", json={"topic": "Observer test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    res = await client.get(f"/api/discussions/{disc_id}/observer/history")
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+async def test_observer_chat_streams_error_for_missing_discussion(client):
+    """Observer chat on non-existent discussion should return error event."""
+    res = await client.post(
+        "/api/discussions/9999/observer/chat",
+        json={"content": "hello", "provider": "openai", "model": "gpt-4o"},
+    )
+    # SSE endpoint returns 200 with error event in the stream
+    assert res.status_code == 200
+    body = res.text
+    assert "error" in body
+    assert "讨论不存在" in body
+
+
+async def test_clear_observer_history(client):
+    """Clear should remove all observer messages."""
+    create_res = await client.post("/api/discussions/", json={"topic": "Clear test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    # Clear on empty history should succeed
+    res = await client.delete(f"/api/discussions/{disc_id}/observer/history")
+    assert res.status_code == 204
+
+    # History should still be empty
+    res = await client.get(f"/api/discussions/{disc_id}/observer/history")
+    assert res.status_code == 200
+    assert res.json() == []
+
+
+async def test_observer_history_in_discussion_detail(client):
+    """DiscussionDetail should include observer_messages field."""
+    create_res = await client.post("/api/discussions/", json={
+        "topic": "Detail observer test",
+        "mode": "custom",
+        "agents": [{"name": "Host", "role": "host"}],
+    })
+    disc_id = create_res.json()["id"]
+
+    res = await client.get(f"/api/discussions/{disc_id}")
+    assert res.status_code == 200
+    data = res.json()
+    assert "observer_messages" in data
+    assert data["observer_messages"] == []

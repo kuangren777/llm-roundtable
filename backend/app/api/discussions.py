@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
-from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse, UserInputRequest
+from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse, UserInputRequest, AttachMaterialsRequest
 
 logger = logging.getLogger(__name__)
 from ..services.discussion_service import (
@@ -25,6 +25,10 @@ from ..services.discussion_service import (
     upload_materials,
     list_materials,
     delete_material,
+    attach_library_materials,
+    summarize_discussion_messages,
+    delete_user_message,
+    update_user_message,
 )
 
 router = APIRouter(prefix="/api/discussions", tags=["discussions"])
@@ -122,6 +126,23 @@ async def complete_discussion_endpoint(discussion_id: int, db: AsyncSession = De
     return {"status": "completed"}
 
 
+@router.post("/{discussion_id}/summarize")
+async def summarize_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
+    """Batch-summarize unsummarized messages, streaming progress via SSE."""
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+
+    async def event_stream():
+        try:
+            async for event in summarize_discussion_messages(db, discussion_id):
+                yield f"data: {event.model_dump_json()}\n\n"
+        except Exception as e:
+            logger.warning("Summarize stream error for discussion %d: %s", discussion_id, e)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.post("/{discussion_id}/user-input")
 async def user_input_endpoint(discussion_id: int, data: UserInputRequest, db: AsyncSession = Depends(get_db)):
     """Submit a user message into a running discussion."""
@@ -129,6 +150,23 @@ async def user_input_endpoint(discussion_id: int, data: UserInputRequest, db: As
     if not discussion:
         raise HTTPException(status_code=404, detail="Discussion not found")
     msg = await submit_user_input(db, discussion_id, data.content)
+    return {"id": msg.id, "content": msg.content}
+
+
+@router.delete("/{discussion_id}/messages/{message_id}", status_code=204)
+async def delete_message_endpoint(discussion_id: int, message_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete a user message."""
+    deleted = await delete_user_message(db, discussion_id, message_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Message not found")
+
+
+@router.put("/{discussion_id}/messages/{message_id}")
+async def update_message_endpoint(discussion_id: int, message_id: int, data: UserInputRequest, db: AsyncSession = Depends(get_db)):
+    """Update a user message."""
+    msg = await update_user_message(db, discussion_id, message_id, data.content)
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
     return {"id": msg.id, "content": msg.content}
 
 
@@ -157,3 +195,14 @@ async def delete_material_endpoint(discussion_id: int, material_id: int, db: Asy
     deleted = await delete_material(db, discussion_id, material_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Material not found")
+
+
+@router.post("/{discussion_id}/attach-materials", response_model=list[MaterialResponse])
+async def attach_materials_endpoint(
+    discussion_id: int, data: AttachMaterialsRequest, db: AsyncSession = Depends(get_db)
+):
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    materials = await attach_library_materials(db, discussion_id, data.material_ids)
+    return materials

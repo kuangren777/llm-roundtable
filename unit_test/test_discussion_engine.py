@@ -9,6 +9,8 @@ from backend.app.services.discussion_engine import (
     _get_agent_by_role,
     _get_agents_by_role,
     _format_history,
+    _parse_host_routing,
+    route_after_host_planning,
     should_continue_or_synthesize,
     AgentInfo,
 )
@@ -38,9 +40,20 @@ def _make_state(**overrides) -> dict:
         "critic_feedback": "",
         "should_continue": True,
         "final_summary": "",
+        "materials": "",
         "phase": "planning",
         "error": None,
         "discussion_id": 0,
+        "single_round_mode": False,
+        "selected_panelists": [],
+        "panelist_tasks": {},
+        "routing_constraints": {},
+        "needs_synthesis": False,
+        "execution_mode": "panelists",
+        "intent_judgment": "",
+        "host_position": "",
+        "open_tasks": [],
+        "cycle_index": 0,
     }
     defaults.update(overrides)
     return defaults
@@ -142,3 +155,100 @@ class TestShouldContinueOrSynthesize:
     def test_single_round_synthesizes_immediately(self):
         state = _make_state(current_round=0, max_rounds=1)
         assert should_continue_or_synthesize(state) == "synthesize"
+
+    def test_single_round_followup_stops_without_synthesis(self):
+        state = _make_state(single_round_mode=True, needs_synthesis=False)
+        assert should_continue_or_synthesize(state) == "stop"
+
+    def test_single_round_followup_can_synthesize(self):
+        state = _make_state(single_round_mode=True, needs_synthesis=True)
+        assert should_continue_or_synthesize(state) == "synthesize"
+
+
+class TestHostRoutingParsing:
+    def test_parses_selected_panelists_and_tasks(self):
+        panelists = [_make_agent("A", "panelist"), _make_agent("B", "panelist")]
+        raw = """
+        {
+          "intent_judgment": "用户要先聚焦风险",
+          "host_position": "我建议先给出最小证据集",
+          "discussion_plan": "先聚焦风险分析",
+          "execution_mode": "panelists",
+          "selected_panelists": ["B"],
+          "assignments": [{"panelist": "B", "task": "从反方角度指出主要风险"}],
+          "open_tasks": ["补齐实验复现细节"],
+          "needs_synthesis": true
+        }
+        """
+        plan, selected, tasks, needs_synthesis, execution_mode, intent_judgment, host_position, reasoning_text, open_tasks = _parse_host_routing(
+            raw_plan=raw,
+            panelists=panelists,
+            constraints={},
+            single_round_mode=True,
+        )
+        assert plan == "先聚焦风险分析"
+        assert selected == ["B"]
+        assert tasks["B"] == "从反方角度指出主要风险"
+        assert needs_synthesis is True
+        assert execution_mode == "panelists"
+        assert intent_judgment == "用户要先聚焦风险"
+        assert host_position == "我建议先给出最小证据集"
+        assert reasoning_text == ""
+        assert open_tasks == ["补齐实验复现细节"]
+
+    def test_falls_back_to_all_panelists_when_json_invalid(self):
+        panelists = [_make_agent("A", "panelist"), _make_agent("B", "panelist")]
+        plan, selected, tasks, needs_synthesis, execution_mode, intent_judgment, host_position, reasoning_text, open_tasks = _parse_host_routing(
+            raw_plan="not-json",
+            panelists=panelists,
+            constraints={},
+            single_round_mode=True,
+        )
+        assert plan == "not-json"
+        assert selected == ["A", "B"]
+        assert set(tasks.keys()) == {"A", "B"}
+        assert needs_synthesis is False
+        assert execution_mode == "panelists"
+        assert intent_judgment
+        assert host_position
+        assert reasoning_text == ""
+        assert len(open_tasks) == 1
+
+    def test_host_only_mode_skips_panelist_selection(self):
+        panelists = [_make_agent("A", "panelist"), _make_agent("B", "panelist")]
+        raw = """
+        {
+          "discussion_plan": "直接固化终稿框架",
+          "execution_mode": "host_only",
+          "selected_panelists": ["A", "B"],
+          "assignments": [{"panelist": "A", "task": "不应被使用"}],
+          "open_tasks": ["补齐伦理披露清单"],
+          "needs_synthesis": false
+        }
+        """
+        plan, selected, tasks, needs_synthesis, execution_mode, _, _, _, open_tasks = _parse_host_routing(
+            raw_plan=raw,
+            panelists=panelists,
+            constraints={},
+            single_round_mode=True,
+        )
+        assert plan == "直接固化终稿框架"
+        assert execution_mode == "host_only"
+        assert selected == []
+        assert tasks == {}
+        assert needs_synthesis is False
+        assert open_tasks == ["补齐伦理披露清单"]
+
+
+class TestHostPlanningRoute:
+    def test_host_only_without_synthesis_stops(self):
+        state = _make_state(execution_mode="host_only", needs_synthesis=False)
+        assert route_after_host_planning(state) == "stop"
+
+    def test_host_only_with_synthesis_routes_to_synthesis(self):
+        state = _make_state(execution_mode="host_only", needs_synthesis=True)
+        assert route_after_host_planning(state) == "synthesize"
+
+    def test_panelists_mode_routes_to_panelists(self):
+        state = _make_state(execution_mode="panelists", needs_synthesis=True)
+        assert route_after_host_planning(state) == "panelists"

@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { getDiscussion, streamDiscussion, stopDiscussion, prepareAgents, updateAgent, listLLMProviders, submitUserInput } from '../services/api'
+import { getDiscussion, streamDiscussion, stopDiscussion, prepareAgents, updateAgent, listLLMProviders, submitUserInput, streamSummarize, deleteMessage, updateMessage, getObserverHistory, clearObserverHistory, streamObserverChat } from '../services/api'
 
 const PHASE_LABELS = {
   planning: '规划中',
@@ -15,6 +15,13 @@ const ROLE_LABELS = {
   user: '用户',
 }
 
+// Parse backend timestamps as UTC (SQLite strips timezone info), display in browser local timezone
+function formatTime(ts) {
+  const s = String(ts)
+  const d = new Date(s.includes('Z') || s.includes('+') ? s : s + 'Z')
+  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
 export default function DiscussionPage({ discussionId }) {
   const [discussion, setDiscussion] = useState(null)
   const [messages, setMessages] = useState([])
@@ -27,13 +34,31 @@ export default function DiscussionPage({ discussionId }) {
   const [llmProgress, setLlmProgress] = useState()
   const [userInput, setUserInput] = useState('')
   const [sendingInput, setSendingInput] = useState(false)
+  const [summarizing, setSummarizing] = useState(false)
+  const [summaryProgress, setSummaryProgress] = useState(null)
+  const [summarizingMsgId, setSummarizingMsgId] = useState(null)
+  const [editingAgentId, setEditingAgentId] = useState(null)
+  // Observer panel state
+  const [observerOpen, setObserverOpen] = useState(false)
+  const [observerMessages, setObserverMessages] = useState([])
+  const [observerInput, setObserverInput] = useState('')
+  const [observerStreaming, setObserverStreaming] = useState(false)
+  const [observerStreamText, setObserverStreamText] = useState('')
+  const [observerConfig, setObserverConfig] = useState({ providerId: null, provider: '', model: '' })
+  const observerStreamRef = useRef(null)
+  const observerEndRef = useRef(null)
   const streamRef = useRef(null)
   const messagesEndRef = useRef(null)
+  const scrollAreaRef = useRef(null)
+  const isNearBottomRef = useRef(true)
 
   const pollRef = useRef(null)
 
+  // Only auto-scroll if user is already near the bottom
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (isNearBottomRef.current) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages])
 
   // Poll for updates when discussion is running (e.g. after page refresh)
@@ -65,14 +90,22 @@ export default function DiscussionPage({ discussionId }) {
   useEffect(() => {
     const load = async () => {
       try {
-        const [d, provs] = await Promise.all([
+        const [d, provs, obsHistory] = await Promise.all([
           getDiscussion(discussionId),
           listLLMProviders(),
+          getObserverHistory(discussionId).catch(() => []),
         ])
         setDiscussion(d)
         setMessages(d.messages || [])
         setPhase(d.status)
         setProviders(provs)
+        setObserverMessages(obsHistory)
+        // Initialize observer config from first available provider+model
+        if (provs.length > 0 && !observerConfig.provider) {
+          const p = provs[0]
+          const m = p.models?.[0]?.model || ''
+          setObserverConfig({ providerId: p.id, provider: p.provider, model: m })
+        }
 
         const RUNNING = ['planning', 'discussing', 'reflecting', 'synthesizing']
         if (d.status === 'completed') {
@@ -167,8 +200,17 @@ export default function DiscussionPage({ discussionId }) {
       (errMsg) => { setStatus('error'); setError(errMsg) },
       (evt) => {
         setLlmProgress(null)
-        setStatus('waiting_input')
-        getDiscussion(discussionId).then(d => setDiscussion(d))
+        // Refresh messages from DB to ensure consistency with persisted state
+        getDiscussion(discussionId).then(d => {
+          setDiscussion(d)
+          setMessages(d.messages || [])
+          setAgents(d.agents || [])
+          if (evt.event_type === 'complete') {
+            setStatus('completed')
+          } else {
+            setStatus('waiting_input')
+          }
+        })
       },
     )
     streamRef.current = controller
@@ -177,7 +219,6 @@ export default function DiscussionPage({ discussionId }) {
   const handleReplan = async () => {
     streamRef.current?.abort()
     try { await stopDiscussion(discussionId) } catch {}
-    setMessages([])
     setLlmProgress(null)
     setError(null)
     startDiscussion()
@@ -195,7 +236,6 @@ export default function DiscussionPage({ discussionId }) {
   const handleUserInput = useCallback(async () => {
     const text = userInput.trim()
     if (!text || sendingInput) return
-    const wasWaiting = status === 'waiting_input'
     setSendingInput(true)
     // Optimistic update — show user message immediately
     setMessages(prev => [...prev, {
@@ -203,12 +243,13 @@ export default function DiscussionPage({ discussionId }) {
       agent_role: 'user',
       content: text,
       phase: 'user_input',
+      created_at: new Date().toISOString(),
     }])
     setUserInput('')
     try {
       await submitUserInput(discussionId, text)
-      // If we were waiting for input, auto-trigger a new discussion cycle
-      if (wasWaiting) {
+      // Trigger a new discussion cycle unless already streaming
+      if (status !== 'running') {
         setSendingInput(false)
         startDiscussion()
         return
@@ -220,6 +261,65 @@ export default function DiscussionPage({ discussionId }) {
     }
   }, [discussionId, userInput, sendingInput, status])
 
+  const handleDeleteMessage = useCallback(async (msgId) => {
+    try {
+      await deleteMessage(discussionId, msgId)
+      setMessages(prev => prev.filter(m => m.id !== msgId))
+    } catch (e) {
+      setError(`删除失败: ${e.message}`)
+    }
+  }, [discussionId])
+
+  const handleEditMessage = useCallback(async (msgId, newContent) => {
+    try {
+      await updateMessage(discussionId, msgId, newContent)
+      setMessages(prev => prev.map(m => m.id === msgId ? { ...m, content: newContent } : m))
+      // Trigger a new discussion cycle after editing
+      if (status !== 'running') {
+        startDiscussion()
+      }
+    } catch (e) {
+      setError(`编辑失败: ${e.message}`)
+    }
+  }, [discussionId, status])
+
+  // Count unsummarized long messages
+  const unsummarizedCount = messages.filter(m => (m.content || '').length >= 200 && !m.summary).length
+
+  const handleSummarize = useCallback(async () => {
+    setSummarizing(true)
+    setSummaryProgress(null)
+    setSummarizingMsgId(null)
+    await streamSummarize(
+      discussionId,
+      (event) => {
+        if (event.event_type === 'summary_progress') {
+          setSummaryProgress(event.content)
+          setSummarizingMsgId(event.round_number)
+        }
+        if (event.event_type === 'summary_done') {
+          const msgId = event.round_number
+          setSummarizingMsgId(null)
+          setMessages(prev => prev.map(m =>
+            m.id === msgId ? { ...m, summary: event.content } : m
+          ))
+        }
+      },
+      (errMsg) => { setError(errMsg); setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null) },
+      () => { setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null) },
+    )
+  }, [discussionId])
+
+  // Auto-trigger summarization when unsummarized messages exist
+  const summarizeRef = useRef(false)
+  useEffect(() => {
+    if (summarizing || summarizeRef.current) return
+    if ((status === 'completed' || status === 'waiting_input') && unsummarizedCount > 0) {
+      summarizeRef.current = true
+      handleSummarize().finally(() => { summarizeRef.current = false })
+    }
+  }, [status, unsummarizedCount, summarizing, handleSummarize])
+
   if (status === 'loading') return <div className="loading">加载中...</div>
   if (status === 'error' && !discussion) return <div className="error-msg">{error}</div>
 
@@ -227,7 +327,8 @@ export default function DiscussionPage({ discussionId }) {
   const title = discussion?.title || ''
 
   return (
-    <div className="discussion-page">
+    <div className="discussion-page-wrapper">
+    <div className={`discussion-page ${observerOpen ? 'with-observer' : ''}`}>
       <div className="discussion-header">
         <h1>{title || topic}</h1>
         <div className="discussion-controls">
@@ -254,19 +355,67 @@ export default function DiscussionPage({ discussionId }) {
               已完成
             </span>
           )}
+          {(status === 'completed' || status === 'waiting_input') && summarizing && (
+            <span className="summary-progress">正在总结 {summaryProgress || '...'}</span>
+          )}
           {(status === 'ready' || status === 'error') && (
             <button className="btn btn-primary" onClick={() => {
-              setMessages([])
               setError(null)
               startDiscussion()
             }} disabled={preparingAgents}>
               {preparingAgents ? '准备中...' : status === 'error' ? '重试' : '开始讨论'}
             </button>
           )}
+          <button
+            className={`btn btn-sm observer-toggle ${observerOpen ? 'active' : ''}`}
+            onClick={() => setObserverOpen(v => !v)}
+          >
+            👁 观察员
+          </button>
         </div>
       </div>
 
-      <div className="discussion-scroll-area">
+      {/* Agent tags — fixed at top, don't scroll with messages */}
+      {status !== 'ready' && status !== 'error' && agents.length > 0 && (
+        <div className="discussion-meta">
+          {agents.map(a => (
+            <span key={a.id} className={`agent-tag agent-tag-${a.role}`}
+              onClick={() => setEditingAgentId(a.id)}
+              style={{ cursor: 'pointer' }}>
+              {a.name}
+              <span className="agent-model">{a.provider}/{a.model}</span>
+            </span>
+          ))}
+        </div>
+      )}
+      {editingAgentId && (
+        <div className="modal-overlay" onClick={() => setEditingAgentId(null)}>
+          <div className="modal-content agent-edit-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <span>编辑专家配置</span>
+              <button className="btn btn-sm" onClick={() => setEditingAgentId(null)}>✕</button>
+            </div>
+            <AgentEditCard
+              agent={agents.find(a => a.id === editingAgentId)}
+              providers={providers}
+              onSave={async (agentId, data) => {
+                await handleAgentSave(agentId, data)
+                setEditingAgentId(null)
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      <div
+        className="discussion-scroll-area"
+        ref={scrollAreaRef}
+        onScroll={() => {
+          const el = scrollAreaRef.current
+          if (!el) return
+          isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120
+        }}
+      >
         {/* Original topic — scrollable, shown when title differs */}
         {title && title !== topic && topic && (
           <div className="discussion-topic-full">{topic}</div>
@@ -295,29 +444,9 @@ export default function DiscussionPage({ discussionId }) {
           </div>
         )}
 
-        {/* Agent tags — when running or completed */}
-        {status !== 'ready' && status !== 'error' && agents.length > 0 && (
-          <div className="discussion-meta">
-            {agents.map(a => (
-              <span key={a.id} className={`agent-tag agent-tag-${a.role}`}>
-                {a.name}
-                <span className="agent-model">{a.provider}/{a.model}</span>
-              </span>
-            ))}
-          </div>
-        )}
-
-        {/* Polling mode banner — after page refresh, no SSE progress available */}
-        {status === 'running' && pollRef.current && !llmProgress && (
-          <div className="polling-banner">
-            <span className="phase-dot pulse" />
-            后台运行中 · {PHASE_LABELS[phase] || phase || '处理中'} · 每 2.5 秒刷新
-          </div>
-        )}
-
         <div className="messages-container">
           {messages.map((msg, idx) => (
-            <MessageBubble key={idx} msg={msg} />
+            <MessageBubble key={msg.id || idx} msg={msg} summarizingMsgId={summarizingMsgId} summarizing={summarizing} onDelete={handleDeleteMessage} onEdit={handleEditMessage} />
           ))}
           <div ref={messagesEndRef} />
         </div>
@@ -351,34 +480,179 @@ export default function DiscussionPage({ discussionId }) {
               {sendingInput ? '发送中...' : status === 'waiting_input' ? '发送并继续' : '发送'}
             </button>
           </div>
-          {/* LLM progress — inline below input bar */}
-          {llmProgress && (
-            <LLMProgressBar progress={llmProgress} />
+          {/* Compact streaming progress — below input bar */}
+          {status === 'running' && (
+            <StreamingStatus agents={agents} phase={phase} llmProgress={llmProgress} messages={messages} currentRound={discussion?.current_round || 0} polling={!!pollRef.current} />
           )}
         </div>
+    </div>
+    {observerOpen && (
+      <ObserverPanel
+        discussionId={discussionId}
+        providers={providers}
+        config={observerConfig}
+        onConfigChange={setObserverConfig}
+        messages={observerMessages}
+        setMessages={setObserverMessages}
+        input={observerInput}
+        setInput={setObserverInput}
+        streaming={observerStreaming}
+        setStreaming={setObserverStreaming}
+        streamText={observerStreamText}
+        setStreamText={setObserverStreamText}
+        streamRef={observerStreamRef}
+        endRef={observerEndRef}
+      />
+    )}
     </div>
   )
 }
 
 
-function LLMProgressBar({ progress }) {
-  const entries = Object.entries(progress)
-  if (!entries.length) return null
-
+function StreamingStatus({ agents, phase, llmProgress, messages, currentRound, polling }) {
+  const phaseLabel = { planning: '规划中', discussing: '讨论中', reflecting: '反思中', synthesizing: '总结中' }
   const formatChars = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 
+  // SSE mode: use llmProgress
+  if (llmProgress && Object.keys(llmProgress).length) {
+    const parts = Object.entries(llmProgress).map(([name, { chars, status }]) => {
+      const label = status === 'done' ? '完成' : status === 'waiting' ? '等待响应' : '思考中'
+      const charStr = chars > 0 ? ` ${formatChars(chars)}字` : ''
+      return `${name} ${label}${charStr}`
+    })
+    return <div className="streaming-status"><span className="streaming-dot" />{parts.join(' · ')}</div>
+  }
+
+  // Polling / phase-based fallback
+  const parts = (() => {
+    if (phase === 'planning' || phase === 'synthesizing') {
+      const host = agents.find(a => a.role === 'host')
+      return host ? [`${host.name} ${phaseLabel[phase]}`] : []
+    }
+    if (phase === 'discussing') {
+      return agents.filter(a => a.role === 'panelist').map(p => {
+        const done = messages.some(m => m.agent_name === p.name && m.round_number === currentRound && m.phase === 'discussing')
+        return `${p.name} ${done ? '已完成' : '讨论中'}`
+      })
+    }
+    if (phase === 'reflecting') {
+      const critic = agents.find(a => a.role === 'critic')
+      return critic ? [`${critic.name} 反思中`] : []
+    }
+    return [phaseLabel[phase] || '运行中']
+  })()
+
+  if (!parts.length) return null
+  return <div className="streaming-status"><span className="streaming-dot" />{parts.join(' · ')}</div>
+}
+
+
+function ObserverPanel({ discussionId, providers, config, onConfigChange, messages, setMessages, input, setInput, streaming, setStreaming, streamText, setStreamText, streamRef, endRef }) {
+  const scrollToBottom = () => endRef.current?.scrollIntoView({ behavior: 'smooth' })
+
+  useEffect(() => { scrollToBottom() }, [messages, streamText])
+
+  // Initialize config from providers if empty
+  useEffect(() => {
+    if (!config.provider && providers.length > 0) {
+      const p = providers[0]
+      const m = p.models?.[0]?.model || ''
+      onConfigChange({ providerId: p.id, provider: p.provider, model: m })
+    }
+  }, [providers, config.provider, onConfigChange])
+
+  const selectedProv = providers.find(p => p.id === config.providerId)
+  const availableModels = (selectedProv?.models || []).map(m => m.model)
+
+  const handleProviderChange = (provId) => {
+    const prov = providers.find(p => p.id === Number(provId))
+    if (!prov) return
+    const models = (prov.models || []).map(m => m.model)
+    onConfigChange({ providerId: prov.id, provider: prov.provider, model: models[0] || '' })
+  }
+
+  const handleSend = async () => {
+    const text = input.trim()
+    if (!text || streaming || !config.provider) return
+    // Optimistic: add user message
+    const userMsg = { id: Date.now(), role: 'user', content: text, created_at: new Date().toISOString() }
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
+    setStreaming(true)
+    setStreamText('')
+
+    const ctrl = await streamObserverChat(
+      discussionId,
+      { content: text, provider: config.provider, model: config.model, provider_id: config.providerId },
+      (chunk) => { setStreamText(prev => prev + chunk) },
+      (err) => { setStreamText(prev => prev + `\n[错误: ${err}]`); setStreaming(false) },
+      () => {
+        // Done — move stream text into messages
+        setStreamText(prev => {
+          if (prev) {
+            setMessages(msgs => [...msgs, { id: Date.now() + 1, role: 'observer', content: prev, created_at: new Date().toISOString() }])
+          }
+          return ''
+        })
+        setStreaming(false)
+      },
+    )
+    streamRef.current = ctrl
+  }
+
+  const handleClear = async () => {
+    if (streaming) { streamRef.current?.abort(); setStreaming(false); setStreamText('') }
+    try { await clearObserverHistory(discussionId) } catch {}
+    setMessages([])
+  }
+
   return (
-    <div className="llm-progress">
-      {entries.map(([name, { chars, status }]) => (
-        <div key={name} className={`llm-progress-item ${status === 'done' ? 'done' : ''}`}>
-          <span className="llm-progress-dot" />
-          <span className="llm-progress-name">{name}</span>
-          <span className="llm-progress-label">
-            {status === 'waiting' ? '等待响应...' : '正在思考...'}
-          </span>
-          {chars > 0 && <span className="llm-progress-chars">{formatChars(chars)} chars</span>}
-        </div>
-      ))}
+    <div className="observer-panel">
+      <div className="observer-header">
+        <span className="observer-title">👁 观察员</span>
+        <button className="btn btn-sm" onClick={handleClear} title="清空对话">清空</button>
+      </div>
+      <div className="observer-config">
+        <select className="form-select form-select-sm" value={config.providerId || ''} onChange={e => handleProviderChange(e.target.value)}>
+          {providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+        </select>
+        <select className="form-select form-select-sm" value={config.model} onChange={e => onConfigChange({ ...config, model: e.target.value })}>
+          {availableModels.map(m => <option key={m} value={m}>{m}</option>)}
+          {config.model && !availableModels.includes(config.model) && <option value={config.model}>{config.model}</option>}
+        </select>
+      </div>
+      <div className="observer-messages">
+        {messages.map((msg, idx) => (
+          <div key={msg.id || idx} className={`observer-msg observer-msg-${msg.role}`}>
+            <div className="observer-msg-content">{msg.content}</div>
+          </div>
+        ))}
+        {streaming && streamText && (
+          <div className="observer-msg observer-msg-observer">
+            <div className="observer-msg-content">{streamText}<span className="typing-cursor" /></div>
+          </div>
+        )}
+        {streaming && !streamText && (
+          <div className="observer-msg observer-msg-observer">
+            <div className="observer-msg-content"><span className="typing-cursor" /> 思考中...</div>
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+      <div className="observer-input-bar">
+        <textarea
+          className="form-input"
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSend() } }}
+          placeholder="向观察员提问... (Ctrl+Enter)"
+          rows={2}
+          disabled={streaming}
+        />
+        <button className="btn btn-primary btn-send" onClick={handleSend} disabled={!input.trim() || streaming || !config.provider}>
+          {streaming ? '回复中...' : '发送'}
+        </button>
+      </div>
     </div>
   )
 }
@@ -535,21 +809,40 @@ function CopyButton({ text }) {
 }
 
 
-function MessageBubble({ msg }) {
+function MessageBubble({ msg, summarizingMsgId, summarizing, onDelete, onEdit }) {
   const role = msg.agent_role || 'panelist'
+  const isUser = role === 'user'
   const isLong = (msg.content || '').length >= 200
   const hasSummary = !!msg.summary
-  // Collapse by default only when a summary exists; otherwise show full content
-  const [expanded, setExpanded] = useState(!hasSummary)
+  const isSummarizing = msg.id && msg.id === summarizingMsgId
+  const [expanded, setExpanded] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [editText, setEditText] = useState(msg.content || '')
+
+  useEffect(() => {
+    if (hasSummary) setExpanded(false)
+  }, [hasSummary])
 
   const roleIcon = { host: '🎯', critic: '🔍', panelist: '💡', user: '👤' }
 
-  // Show summary when collapsed + summary available, otherwise full content
-  const displayText = !expanded && hasSummary ? msg.summary : msg.content
+  const displayText = !isLong
+    ? msg.content
+    : expanded
+      ? msg.content
+      : hasSummary
+        ? msg.summary
+        : `${msg.agent_name} 总结中...`
+
+  const handleSaveEdit = () => {
+    const text = editText.trim()
+    if (!text || text === msg.content) { setEditing(false); return }
+    onEdit?.(msg.id, text)
+    setEditing(false)
+  }
 
   return (
     <div className={`message-bubble role-${role}`}>
-      <div className="message-header" onClick={() => isLong && setExpanded(v => !v)}>
+      <div className="message-header" onClick={() => !editing && isLong && setExpanded(v => !v)}>
         <span className="message-agent">
           <span className={`role-icon role-icon-${role}`}>
             {roleIcon[role] || '💡'}
@@ -557,19 +850,47 @@ function MessageBubble({ msg }) {
           {msg.agent_name}
         </span>
         <span className="message-meta">
+          {msg.created_at && (
+            <span className="message-time">
+              {formatTime(msg.created_at)}
+            </span>
+          )}
           {PHASE_LABELS[msg.phase] || msg.phase}
-          {msg.round_number !== undefined && role !== 'user' && ` · 第${msg.round_number + 1}轮`}
-          {isLong && (
+          {msg.round_number !== undefined && !isUser && ` · 第${msg.round_number + 1}轮`}
+          {isLong && !editing && (
             <span className="expand-toggle">
               {expanded ? '收起' : '展开'}
             </span>
           )}
+          {isUser && msg.id && !editing && (
+            <span className="user-msg-actions">
+              <span className="msg-action-btn" onClick={e => { e.stopPropagation(); setEditText(msg.content || ''); setEditing(true) }}>编辑</span>
+              <span className="msg-action-btn danger" onClick={e => { e.stopPropagation(); if (window.confirm('确定删除这条消息？')) onDelete?.(msg.id) }}>删除</span>
+            </span>
+          )}
         </span>
       </div>
-      <div className={`message-content ${!expanded ? 'collapsed' : ''}`}>
-        {displayText}
-        <CopyButton text={msg.content} />
-      </div>
+      {editing ? (
+        <div className="message-edit-area">
+          <textarea
+            className="form-input message-edit-input"
+            value={editText}
+            onChange={e => setEditText(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSaveEdit() } }}
+            rows={3}
+            autoFocus
+          />
+          <div className="message-edit-actions">
+            <button className="btn btn-sm btn-primary" onClick={handleSaveEdit}>保存并继续讨论</button>
+            <button className="btn btn-sm" onClick={() => setEditing(false)}>取消</button>
+          </div>
+        </div>
+      ) : (
+        <div className={`message-content ${!expanded && isLong ? 'collapsed' : ''}`}>
+          {displayText}
+          <CopyButton text={msg.content} />
+        </div>
+      )}
     </div>
   )
 }

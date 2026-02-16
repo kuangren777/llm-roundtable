@@ -11,6 +11,8 @@ from .database import init_db
 from .api.discussions import router as discussions_router
 from .api.llm_providers import router as llm_providers_router
 from .api.settings import router as settings_router
+from .api.materials import router as materials_router
+from .api.observer import router as observer_router
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
@@ -39,6 +41,8 @@ app.add_middleware(
 app.include_router(discussions_router)
 app.include_router(llm_providers_router)
 app.include_router(settings_router)
+app.include_router(materials_router)
+app.include_router(observer_router)
 
 
 @app.get("/api/health")

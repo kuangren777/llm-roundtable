@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -165,6 +166,7 @@ async def get_discussion(db: AsyncSession, discussion_id: int) -> Discussion | N
             selectinload(Discussion.agents),
             selectinload(Discussion.messages),
             selectinload(Discussion.materials),
+            selectinload(Discussion.observer_messages),
         )
         .where(Discussion.id == discussion_id)
     )
@@ -355,6 +357,28 @@ async def upload_materials(db: AsyncSession, discussion_id: int, files: list[Upl
     await db.commit()
     for m in materials:
         await db.refresh(m)
+
+    # Also create library copies for future reuse
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+    for m in materials:
+        try:
+            lib_path = os.path.join(LIBRARY_DIR, f"{int(datetime.now(timezone.utc).timestamp())}_{m.filename}")
+            if os.path.exists(m.filepath):
+                shutil.copy2(m.filepath, lib_path)
+            lib_copy = DiscussionMaterial(
+                discussion_id=None,
+                filename=m.filename,
+                filepath=lib_path,
+                file_type=m.file_type,
+                mime_type=m.mime_type,
+                file_size=m.file_size,
+                text_content=m.text_content,
+            )
+            db.add(lib_copy)
+        except Exception:
+            pass  # library copy is best-effort
+    await db.commit()
+
     return materials
 
 
@@ -400,6 +424,255 @@ def _build_materials_text(materials: list[DiscussionMaterial]) -> str:
     return "\n\n".join(parts)
 
 
+LIBRARY_DIR = os.path.join(UPLOAD_DIR, "library")
+
+
+async def generate_material_filename(text: str) -> str:
+    """Use LLM to generate a short Chinese filename for pasted text, fallback to first 20 chars."""
+    fallback = text.strip().replace("\n", " ")[:20] or "未命名"
+    try:
+        cfg = await _get_summary_model_config()
+        if not cfg:
+            return fallback
+        title = await call_llm(
+            provider=cfg.get("provider", "openai"),
+            model=cfg.get("model", "gpt-4o-mini"),
+            messages=[{"role": "user", "content": f"请用5-10个中文字为以下文本生成一个简短的文件名（不含扩展名），只输出文件名本身：\n\n{text[:500]}"}],
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+            temperature=0.3,
+            max_tokens=30,
+        )
+        title = title.strip().strip('"\'""''')[:30]
+        return title or fallback
+    except Exception:
+        return fallback
+
+
+async def generate_material_metadata(text: str) -> dict:
+    """Use LLM to generate metadata (summary, keywords, type) for pasted text."""
+    try:
+        cfg = await _get_summary_model_config()
+        if not cfg:
+            return {}
+        raw = await call_llm(
+            provider=cfg.get("provider", "openai"),
+            model=cfg.get("model", "gpt-4o-mini"),
+            messages=[{"role": "user", "content": (
+                "为以下文本生成 metadata JSON，包含以下字段：\n"
+                '- summary: 一句话中文摘要\n'
+                '- keywords: 3-5个中文关键词数组\n'
+                '- type: 文本类型（如"技术文档"、"新闻"、"论文"、"笔记"等）\n'
+                '只输出合法 JSON，不要其他内容。\n\n'
+                f"{text[:1000]}"
+            )}],
+            api_key=cfg.get("api_key"),
+            base_url=cfg.get("base_url"),
+            temperature=0.3,
+            max_tokens=200,
+        )
+        # Strip markdown code fences if present
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+async def _process_material_bg(material_id: int, text: str):
+    """Background task: generate filename + metadata for a processing material."""
+    try:
+        filename = await generate_material_filename(text)
+        if not filename.endswith(".md"):
+            filename += ".md"
+        metadata = await generate_material_metadata(text)
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(DiscussionMaterial).where(DiscussionMaterial.id == material_id)
+            )
+            material = result.scalar_one_or_none()
+            if not material:
+                return
+
+            # Rename file on disk
+            old_path = material.filepath
+            new_path = os.path.join(LIBRARY_DIR, f"{int(datetime.now(timezone.utc).timestamp())}_{filename}")
+            if os.path.exists(old_path):
+                os.rename(old_path, new_path)
+
+            material.filename = filename
+            material.filepath = new_path
+            material.meta_info = metadata if metadata else None
+            material.status = "ready"
+            await db.commit()
+    except Exception as e:
+        logger.warning("Failed to process material %d: %s", material_id, e)
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(DiscussionMaterial).where(DiscussionMaterial.id == material_id)
+                )
+                material = result.scalar_one_or_none()
+                if material:
+                    material.status = "failed"
+                    await db.commit()
+        except Exception:
+            pass
+
+
+async def save_text_material(db: AsyncSession, text: str, filename_override: str | None = None) -> DiscussionMaterial:
+    """Save pasted text as .md to library (discussion_id=NULL).
+
+    Returns immediately with status='processing'. A background task generates
+    the LLM filename and metadata asynchronously.
+    """
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+
+    # Save with placeholder filename immediately
+    placeholder = filename_override or "处理中.md"
+    if not placeholder.endswith(".md"):
+        placeholder += ".md"
+
+    filepath = os.path.join(LIBRARY_DIR, f"{int(datetime.now(timezone.utc).timestamp())}_{placeholder}")
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    material = DiscussionMaterial(
+        discussion_id=None,
+        filename=placeholder,
+        filepath=filepath,
+        file_type="file",
+        mime_type="text/markdown",
+        file_size=len(text.encode("utf-8")),
+        text_content=text,
+        status="processing" if not filename_override else "ready",
+    )
+    db.add(material)
+    await db.commit()
+    await db.refresh(material)
+
+    # Spawn background processing if no override was given
+    if not filename_override:
+        asyncio.create_task(_process_material_bg(material.id, text))
+
+    return material
+
+
+async def list_library_materials(db: AsyncSession) -> list[DiscussionMaterial]:
+    """List all library materials (discussion_id IS NULL)."""
+    result = await db.execute(
+        select(DiscussionMaterial)
+        .where(DiscussionMaterial.discussion_id.is_(None))
+        .order_by(DiscussionMaterial.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def delete_library_material(db: AsyncSession, material_id: int) -> bool:
+    """Delete a library material by ID (only if discussion_id IS NULL)."""
+    result = await db.execute(
+        select(DiscussionMaterial).where(
+            DiscussionMaterial.id == material_id,
+            DiscussionMaterial.discussion_id.is_(None),
+        )
+    )
+    material = result.scalar_one_or_none()
+    if not material:
+        return False
+    if os.path.exists(material.filepath):
+        os.remove(material.filepath)
+    await db.delete(material)
+    await db.commit()
+    return True
+
+
+async def attach_library_materials(db: AsyncSession, discussion_id: int, material_ids: list[int]) -> list[DiscussionMaterial]:
+    """Copy library items into a discussion by creating new rows with discussion_id set."""
+    result = await db.execute(
+        select(DiscussionMaterial).where(
+            DiscussionMaterial.id.in_(material_ids),
+            DiscussionMaterial.discussion_id.is_(None),
+        )
+    )
+    library_items = list(result.scalars().all())
+
+    upload_path = os.path.join(UPLOAD_DIR, str(discussion_id))
+    os.makedirs(upload_path, exist_ok=True)
+
+    attached = []
+    for item in library_items:
+        # Copy file to discussion directory
+        dest = os.path.join(upload_path, item.filename)
+        if os.path.exists(item.filepath):
+            shutil.copy2(item.filepath, dest)
+
+        copy = DiscussionMaterial(
+            discussion_id=discussion_id,
+            filename=item.filename,
+            filepath=dest,
+            file_type=item.file_type,
+            mime_type=item.mime_type,
+            file_size=item.file_size,
+            text_content=item.text_content,
+        )
+        db.add(copy)
+        attached.append(copy)
+
+    await db.commit()
+    for m in attached:
+        await db.refresh(m)
+    return attached
+
+
+async def upload_to_library(db: AsyncSession, files: list[UploadFile]) -> list[DiscussionMaterial]:
+    """Upload files directly to the library (discussion_id=NULL)."""
+    os.makedirs(LIBRARY_DIR, exist_ok=True)
+
+    materials = []
+    for file in files:
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext in ALLOWED_IMAGE_EXTS:
+            file_type = "image"
+        elif ext in ALLOWED_FILE_EXTS:
+            file_type = "file"
+        else:
+            continue
+
+        content = await file.read()
+        if len(content) > MAX_FILE_SIZE:
+            continue
+
+        filepath = os.path.join(LIBRARY_DIR, f"{int(datetime.now(timezone.utc).timestamp())}_{file.filename}")
+        with open(filepath, "wb") as f:
+            f.write(content)
+
+        text_content = None
+        if ext in (".txt", ".md"):
+            try:
+                text_content = content.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        material = DiscussionMaterial(
+            discussion_id=None,
+            filename=file.filename,
+            filepath=filepath,
+            file_type=file_type,
+            mime_type=file.content_type,
+            file_size=len(content),
+            text_content=text_content,
+        )
+        db.add(material)
+        materials.append(material)
+
+    await db.commit()
+    for m in materials:
+        await db.refresh(m)
+    return materials
+
+
 async def _resolve_agents(discussion: Discussion) -> list[dict]:
     """Resolve agent definitions based on discussion mode and llm_configs."""
     llm_configs = discussion.llm_configs or []
@@ -430,6 +703,7 @@ async def _resolve_agents(discussion: Discussion) -> list[dict]:
     return assign_llms_to_agents(agent_defs, llm_configs)
 
 
+
 async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator[DiscussionEvent, None]:
     """Run the discussion and yield SSE events."""
     discussion = await get_discussion(db, discussion_id)
@@ -437,25 +711,13 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         yield DiscussionEvent(event_type="error", content="Discussion not found")
         return
 
-    if discussion.status == DiscussionStatus.COMPLETED:
-        yield DiscussionEvent(event_type="error", content="Discussion already completed")
-        return
-
-    if discussion.status not in (DiscussionStatus.CREATED, DiscussionStatus.FAILED, DiscussionStatus.WAITING_INPUT):
+    if discussion.status not in (DiscussionStatus.CREATED, DiscussionStatus.FAILED, DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED):
         yield DiscussionEvent(event_type="error", content="Discussion is already running")
         return
 
-    # Continuing from WAITING_INPUT — keep messages, reset round counter for new cycle
-    resuming = discussion.status == DiscussionStatus.WAITING_INPUT
-
-    # Retry cleanup: clear old messages and reset round counter
-    if discussion.status == DiscussionStatus.FAILED:
-        for msg in list(discussion.messages):
-            await db.delete(msg)
-        discussion.current_round = 0
-        discussion.final_summary = None
-        await db.commit()
-        await db.refresh(discussion, ["messages"])
+    # WAITING_INPUT/COMPLETED follow-up runs are always single-round.
+    single_round_mode = discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
+    carry_history = discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED)
 
     # Resolve agents if not yet generated (non-custom modes)
     if not discussion.agents:
@@ -499,20 +761,34 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         await db.commit()
         return
 
+    # In follow-up single-round mode, user messages are already saved in DB.
+    # Clear pending queue so host_planning_node does not re-inject duplicates.
+    if single_round_mode:
+        _pending_user_messages.pop(discussion_id, None)
+
     # Build materials text from uploaded files
     materials_text = _build_materials_text(list(discussion.materials)) if discussion.materials else ""
 
-    # Initialize state — when resuming, carry over previous messages for context
+    # Initialize state — carry prior messages when continuing an existing discussion.
     prior_messages = []
-    if resuming and discussion.messages:
+    if carry_history and discussion.messages:
         for m in discussion.messages:
             prior_messages.append({
                 "agent_name": m.agent_name,
                 "agent_role": m.agent_role,
                 "content": m.content,
                 "round_number": m.round_number,
+                "cycle_index": getattr(m, "cycle_index", 0),
                 "phase": m.phase or "",
             })
+
+    existing_cycle = max((getattr(m, "cycle_index", 0) for m in discussion.messages), default=-1)
+    if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED):
+        cycle_index = existing_cycle + 1
+    elif existing_cycle >= 0:
+        cycle_index = existing_cycle
+    else:
+        cycle_index = 0
 
     initial_state: DiscussionState = {
         "topic": discussion.topic,
@@ -528,6 +804,16 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         "phase": "planning",
         "error": None,
         "discussion_id": discussion_id,
+        "single_round_mode": single_round_mode,
+        "selected_panelists": [],
+        "panelist_tasks": {},
+        "routing_constraints": {},
+        "needs_synthesis": False,
+        "execution_mode": "panelists",
+        "intent_judgment": "",
+        "host_position": "",
+        "open_tasks": [],
+        "cycle_index": cycle_index,
     }
 
     discussion.status = DiscussionStatus.PLANNING
@@ -618,6 +904,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                         agent_role=msg_data["agent_role"],
                         content=msg_data["content"],
                         round_number=msg_data.get("round_number", 0),
+                        cycle_index=msg_data.get("cycle_index", cycle_index),
                         phase=msg_data.get("phase", ""),
                     )
                     db.add(msg)
@@ -630,6 +917,8 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                         content=msg_data["content"],
                         phase=msg_data.get("phase", ""),
                         round_number=msg_data.get("round_number", 0),
+                        cycle_index=msg_data.get("cycle_index", cycle_index),
+                        created_at=msg.created_at,
                     )
 
                 if phase:
@@ -740,6 +1029,7 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                             agent_role=msg_data["agent_role"],
                             content=msg_data["content"],
                             round_number=msg_data.get("round_number", 0),
+                            cycle_index=msg_data.get("cycle_index", 0),
                             phase=msg_data.get("phase", ""),
                         )
                         db.add(msg)
@@ -816,18 +1106,87 @@ async def complete_discussion(db: AsyncSession, discussion_id: int) -> bool:
     return True
 
 
+async def summarize_discussion_messages(db: AsyncSession, discussion_id: int) -> AsyncGenerator[DiscussionEvent, None]:
+    """Batch-summarize unsummarized long messages, yielding SSE progress events."""
+    result = await db.execute(
+        select(Message)
+        .where(Message.discussion_id == discussion_id, Message.summary.is_(None))
+        .order_by(Message.id)
+    )
+    all_msgs = [m for m in result.scalars().all() if len(m.content) >= MIN_SUMMARY_LENGTH]
+
+    if not all_msgs:
+        yield DiscussionEvent(event_type="summary_complete", content="没有需要总结的消息")
+        return
+
+    cfg = await _get_summary_model_config()
+    if not cfg:
+        yield DiscussionEvent(event_type="error", content="未配置总结模型，请在设置中配置 Summary Model")
+        return
+
+    total = len(all_msgs)
+    for i, msg in enumerate(all_msgs):
+        yield DiscussionEvent(
+            event_type="summary_progress",
+            agent_name=msg.agent_name,
+            round_number=msg.id,
+            content=f"{i + 1}/{total}",
+        )
+        try:
+            summary = await call_llm(
+                provider=cfg.get("provider", "openai"),
+                model=cfg.get("model", "gpt-4o-mini"),
+                messages=[{"role": "user", "content": f"请用2-3句话简洁总结以下内容，保留关键观点，不要添加额外评论：\n\n{msg.content}"}],
+                api_key=cfg.get("api_key"),
+                base_url=cfg.get("base_url"),
+                temperature=0.3,
+                max_tokens=200,
+            )
+            msg.summary = summary.strip()
+            await db.commit()
+            yield DiscussionEvent(
+                event_type="summary_done",
+                agent_name=msg.agent_name,
+                round_number=msg.id,
+                content=msg.summary,
+            )
+        except Exception as e:
+            logger.warning("Failed to summarize message %d: %s", msg.id, e)
+            yield DiscussionEvent(
+                event_type="summary_error",
+                agent_name=msg.agent_name,
+                round_number=msg.id,
+                content=str(e),
+            )
+
+    yield DiscussionEvent(event_type="summary_complete", content="总结完成")
+
+
 async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) -> Message:
     """Submit a user message into a running discussion.
 
     The message is saved to DB immediately and queued for injection
     into the next host_planning_node round.
     """
+    discussion = await get_discussion(db, discussion_id)
+    if discussion:
+        existing_cycle = max((getattr(m, "cycle_index", 0) for m in discussion.messages), default=-1)
+        if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED):
+            cycle_index = existing_cycle + 1
+        elif existing_cycle >= 0:
+            cycle_index = existing_cycle
+        else:
+            cycle_index = 0
+    else:
+        cycle_index = 0
+
     msg = Message(
         discussion_id=discussion_id,
         agent_name="用户",
         agent_role=AgentRole.USER,
         content=content,
         round_number=0,
+        cycle_index=cycle_index,
         phase="user_input",
     )
     db.add(msg)
@@ -838,6 +1197,42 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
     _pending_user_messages.setdefault(discussion_id, []).append({
         "agent_name": "用户",
         "content": content,
+        "cycle_index": cycle_index,
     })
 
+    return msg
+
+
+async def delete_user_message(db: AsyncSession, discussion_id: int, message_id: int) -> bool:
+    """Delete a user message."""
+    result = await db.execute(
+        select(Message).where(
+            Message.id == message_id,
+            Message.discussion_id == discussion_id,
+            Message.agent_role == AgentRole.USER,
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        return False
+    await db.delete(msg)
+    await db.commit()
+    return True
+
+
+async def update_user_message(db: AsyncSession, discussion_id: int, message_id: int, content: str) -> Message | None:
+    """Update a user message content."""
+    result = await db.execute(
+        select(Message).where(
+            Message.id == message_id,
+            Message.discussion_id == discussion_id,
+            Message.agent_role == AgentRole.USER,
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        return None
+    msg.content = content
+    await db.commit()
+    await db.refresh(msg)
     return msg

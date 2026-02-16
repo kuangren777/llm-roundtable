@@ -4,15 +4,18 @@ import os
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from backend.app.database import Base, get_db
 from backend.app.main import app
 
-TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-test_engine = create_async_engine(TEST_DB_URL, echo=False)
+TEST_DB_URL = "sqlite+aiosqlite:////tmp/multi_llm_debate_test.db"
+TEST_DB_PATH = "/tmp/multi_llm_debate_test.db"
+test_engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
 TestSession = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -27,11 +30,15 @@ app.dependency_overrides[get_db] = override_get_db
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
     """Create and tear down test database for each test."""
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
+    sync_engine = create_engine(TEST_DB_URL.replace("sqlite+aiosqlite", "sqlite"), echo=False)
+    Base.metadata.create_all(sync_engine)
     yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    Base.metadata.drop_all(sync_engine)
+    sync_engine.dispose()
+    if os.path.exists(TEST_DB_PATH):
+        os.remove(TEST_DB_PATH)
 
 
 @pytest_asyncio.fixture

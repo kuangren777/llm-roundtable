@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import { createDiscussion, uploadMaterials, listLLMProviders } from '../services/api'
+import { createDiscussion, uploadMaterials, listLLMProviders, listLibraryMaterials, pasteTextMaterial, attachMaterialsToDiscussion } from '../services/api'
 
 const MODE_OPTIONS = [
   { value: 'auto', label: '自动 (Auto)', desc: '由 LLM 分析话题，动态生成最优专家组合' },
@@ -38,6 +38,15 @@ export default function CreatePage({ onCreated }) {
   const [dragOver, setDragOver] = useState(false)
   const fileInputRef = useRef(null)
 
+  // Material tabs: 'upload' | 'paste' | 'library'
+  const [materialTab, setMaterialTab] = useState('upload')
+  const [pasteText, setPasteText] = useState('')
+  const [pastingLoading, setPastingLoading] = useState(false)
+  const [libraryItems, setLibraryItems] = useState([])
+  const [selectedLibraryIds, setSelectedLibraryIds] = useState(new Set())
+  const [librarySearch, setLibrarySearch] = useState('')
+  const [libraryLoading, setLibraryLoading] = useState(false)
+
   // Step 2 (modal) state
   const [showModal, setShowModal] = useState(false)
   const [mode, setMode] = useState('auto')
@@ -46,12 +55,34 @@ export default function CreatePage({ onCreated }) {
 
   // LLM provider/model state
   const [providers, setProviders] = useState([])
-  const [allModels, setAllModels] = useState([])  // flattened: { id, model, providerName, provider }
+  const [allModels, setAllModels] = useState([])
   const [selectedModelIds, setSelectedModelIds] = useState(new Set())
   const [hostModelId, setHostModelId] = useState(null)
 
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState(null)
+
+  // Load library when tab switches to library
+  useEffect(() => {
+    if (materialTab !== 'library') return
+    setLibraryLoading(true)
+    listLibraryMaterials()
+      .then(items => setLibraryItems(items))
+      .catch(() => {})
+      .finally(() => setLibraryLoading(false))
+  }, [materialTab])
+
+  // Poll library while any items are processing
+  useEffect(() => {
+    const hasProcessing = libraryItems.some(item => item.status === 'processing')
+    if (!hasProcessing) return
+    const timer = setInterval(() => {
+      listLibraryMaterials()
+        .then(items => setLibraryItems(items))
+        .catch(() => {})
+    }, 2000)
+    return () => clearInterval(timer)
+  }, [libraryItems])
 
   // Load providers when modal opens
   useEffect(() => {
@@ -65,7 +96,6 @@ export default function CreatePage({ onCreated }) {
         }
       }
       setAllModels(flat)
-      // Auto-select all models by default
       const ids = new Set(flat.map(m => m.id))
       setSelectedModelIds(ids)
       if (flat.length > 0 && !hostModelId) setHostModelId(flat[0].id)
@@ -116,6 +146,43 @@ export default function CreatePage({ onCreated }) {
   const uploadedFiles = files.filter(f => !f.preview)
   const uploadedImages = files.filter(f => f.preview)
 
+  // --- Paste text handling ---
+  const handlePasteSubmit = async () => {
+    if (!pasteText.trim()) return
+    setPastingLoading(true)
+    try {
+      const result = await pasteTextMaterial(pasteText)
+      // Auto-select the new library item
+      setSelectedLibraryIds(prev => new Set([...prev, result.id]))
+      // Refresh library list (will include the "processing" item)
+      const items = await listLibraryMaterials()
+      setLibraryItems(items)
+      setPasteText('')
+      setMaterialTab('library')  // Switch to library to show the result
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setPastingLoading(false)
+    }
+  }
+
+  // --- Library selection ---
+  const toggleLibraryItem = (id) => {
+    setSelectedLibraryIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const filteredLibrary = librarySearch
+    ? libraryItems.filter(item =>
+        item.filename.toLowerCase().includes(librarySearch.toLowerCase()) ||
+        (item.text_preview || '').toLowerCase().includes(librarySearch.toLowerCase())
+      )
+    : libraryItems
+
   // --- Step 1 → Step 2 ---
   const handleNext = () => {
     if (!topic.trim()) { setError('请输入讨论主题'); return }
@@ -129,7 +196,6 @@ export default function CreatePage({ onCreated }) {
       const next = new Set(prev)
       if (next.has(id)) {
         next.delete(id)
-        // If we deselected the host model, pick another
         if (hostModelId === id) {
           const remaining = allModels.filter(m => next.has(m.id))
           setHostModelId(remaining.length > 0 ? remaining[0].id : null)
@@ -160,7 +226,6 @@ export default function CreatePage({ onCreated }) {
     setAgents(prev => prev.filter((_, i) => i !== idx))
   }
 
-  // Build provider→models map for custom mode dropdowns
   const providerModels = {}
   for (const p of providers) {
     const key = p.provider
@@ -212,9 +277,15 @@ export default function CreatePage({ onCreated }) {
 
       const result = await createDiscussion(data)
 
-      // Upload materials if any
+      // Upload drag-drop files
       if (files.length > 0) {
         await uploadMaterials(result.id, files.map(f => f.file))
+      }
+
+      // Attach selected library items
+      const libIds = [...selectedLibraryIds]
+      if (libIds.length > 0) {
+        await attachMaterialsToDiscussion(result.id, libIds)
       }
 
       setShowModal(false)
@@ -227,6 +298,7 @@ export default function CreatePage({ onCreated }) {
   }
 
   const selectedMode = MODE_OPTIONS.find(m => m.value === mode)
+  const totalMaterials = files.length + selectedLibraryIds.size
 
   return (
     <div className="create-page">
@@ -244,65 +316,184 @@ export default function CreatePage({ onCreated }) {
         />
       </div>
 
-      {/* Material upload area */}
+      {/* Material section with tabs */}
       <div className="form-section">
-        <label className="form-label">讨论材料（可选）</label>
-        <div
-          className={`upload-area ${dragOver ? 'drag-over' : ''}`}
-          onDrop={handleDrop}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            accept={[...ALLOWED_FILE_EXTS, ...ALLOWED_IMAGE_EXTS].join(',')}
-            onChange={handleFileSelect}
-            style={{ display: 'none' }}
-          />
-          <div className="upload-area-content">
-            <span className="upload-icon">📎</span>
-            <span>拖拽文件到此处，或点击选择</span>
-            <span className="upload-hint">支持 txt, md, pdf, docx, png, jpg, gif, webp（单文件 ≤ 10MB）</span>
-          </div>
+        <label className="form-label">
+          讨论材料（可选）
+          {totalMaterials > 0 && <span className="material-count">{totalMaterials} 项已选</span>}
+        </label>
+
+        <div className="material-tabs">
+          <button
+            className={`material-tab ${materialTab === 'upload' ? 'active' : ''}`}
+            onClick={() => setMaterialTab('upload')}
+          >
+            上传文件{files.length > 0 && ` (${files.length})`}
+          </button>
+          <button
+            className={`material-tab ${materialTab === 'paste' ? 'active' : ''}`}
+            onClick={() => setMaterialTab('paste')}
+          >
+            粘贴文本
+          </button>
+          <button
+            className={`material-tab ${materialTab === 'library' ? 'active' : ''}`}
+            onClick={() => setMaterialTab('library')}
+          >
+            素材库{selectedLibraryIds.size > 0 && ` (${selectedLibraryIds.size})`}
+          </button>
         </div>
 
-        {/* Uploaded files list */}
-        {uploadedFiles.length > 0 && (
-          <div className="upload-file-list">
-            <div className="upload-section-label">文件</div>
-            {uploadedFiles.map((item, idx) => {
-              const realIdx = files.indexOf(item)
-              return (
-                <div key={realIdx} className="upload-file-item">
-                  <span className="upload-file-icon">📄</span>
-                  <span className="upload-file-name">{item.file.name}</span>
-                  <span className="upload-file-size">{formatFileSize(item.file.size)}</span>
-                  <button className="btn-icon btn-remove" onClick={(e) => { e.stopPropagation(); removeFile(realIdx) }}>×</button>
+        {/* Upload tab */}
+        {materialTab === 'upload' && (
+          <>
+            <div
+              className={`upload-area ${dragOver ? 'drag-over' : ''}`}
+              onDrop={handleDrop}
+              onDragOver={handleDragOver}
+              onDragLeave={handleDragLeave}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept={[...ALLOWED_FILE_EXTS, ...ALLOWED_IMAGE_EXTS].join(',')}
+                onChange={handleFileSelect}
+                style={{ display: 'none' }}
+              />
+              <div className="upload-area-content">
+                <span className="upload-icon">📎</span>
+                <span>拖拽文件到此处，或点击选择</span>
+                <span className="upload-hint">支持 txt, md, pdf, docx, png, jpg, gif, webp（单文件 ≤ 10MB）</span>
+              </div>
+            </div>
+
+            {uploadedFiles.length > 0 && (
+              <div className="upload-file-list">
+                <div className="upload-section-label">文件</div>
+                {uploadedFiles.map((item, idx) => {
+                  const realIdx = files.indexOf(item)
+                  return (
+                    <div key={realIdx} className="upload-file-item">
+                      <span className="upload-file-icon">📄</span>
+                      <span className="upload-file-name">{item.file.name}</span>
+                      <span className="upload-file-size">{formatFileSize(item.file.size)}</span>
+                      <button className="btn-icon btn-remove" onClick={(e) => { e.stopPropagation(); removeFile(realIdx) }}>×</button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+
+            {uploadedImages.length > 0 && (
+              <div className="upload-file-list">
+                <div className="upload-section-label">图片</div>
+                <div className="upload-thumb-grid">
+                  {uploadedImages.map((item, idx) => {
+                    const realIdx = files.indexOf(item)
+                    return (
+                      <div key={realIdx} className="upload-thumb">
+                        <img src={item.preview} alt={item.file.name} />
+                        <button className="upload-thumb-remove" onClick={(e) => { e.stopPropagation(); removeFile(realIdx) }}>×</button>
+                        <span className="upload-thumb-name">{item.file.name}</span>
+                      </div>
+                    )
+                  })}
                 </div>
-              )
-            })}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Paste text tab */}
+        {materialTab === 'paste' && (
+          <div className="paste-section">
+            <textarea
+              className="form-input paste-area"
+              value={pasteText}
+              onChange={e => setPasteText(e.target.value)}
+              placeholder="粘贴文本内容，将自动生成文件名并保存到素材库..."
+              rows={8}
+            />
+            <button
+              className="btn btn-primary"
+              onClick={handlePasteSubmit}
+              disabled={pastingLoading || !pasteText.trim()}
+              style={{ marginTop: 8, alignSelf: 'flex-end' }}
+            >
+              {pastingLoading ? '保存中...' : '保存到素材库'}
+            </button>
           </div>
         )}
 
-        {/* Uploaded images */}
-        {uploadedImages.length > 0 && (
-          <div className="upload-file-list">
-            <div className="upload-section-label">图片</div>
-            <div className="upload-thumb-grid">
-              {uploadedImages.map((item, idx) => {
-                const realIdx = files.indexOf(item)
-                return (
-                  <div key={realIdx} className="upload-thumb">
-                    <img src={item.preview} alt={item.file.name} />
-                    <button className="upload-thumb-remove" onClick={(e) => { e.stopPropagation(); removeFile(realIdx) }}>×</button>
-                    <span className="upload-thumb-name">{item.file.name}</span>
-                  </div>
-                )
-              })}
-            </div>
+        {/* Library tab */}
+        {materialTab === 'library' && (
+          <div className="library-section">
+            <input
+              className="form-input library-search"
+              placeholder="搜索素材..."
+              value={librarySearch}
+              onChange={e => setLibrarySearch(e.target.value)}
+            />
+            {libraryLoading ? (
+              <div className="library-empty">加载中...</div>
+            ) : filteredLibrary.length === 0 ? (
+              <div className="library-empty">
+                {libraryItems.length === 0 ? '素材库为空，上传文件或粘贴文本后会自动保存到这里' : '无匹配结果'}
+              </div>
+            ) : (
+              <div className="library-list">
+                {filteredLibrary.map(item => (
+                  <label
+                    key={item.id}
+                    className={`library-item ${selectedLibraryIds.has(item.id) ? 'selected' : ''}`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedLibraryIds.has(item.id)}
+                      onChange={() => toggleLibraryItem(item.id)}
+                    />
+                    <div className="library-item-info">
+                      <span className="library-item-name">
+                        {item.status === 'processing' ? (
+                          <span className="processing-indicator">处理中...</span>
+                        ) : item.status === 'failed' ? (
+                          <span className="failed-indicator">处理失败</span>
+                        ) : (
+                          item.filename
+                        )}
+                      </span>
+                      <span className="library-item-meta">
+                        {item.file_size ? formatFileSize(item.file_size) : ''} · {new Date(item.created_at).toLocaleDateString()}
+                      </span>
+                      {item.text_preview && (
+                        <span className="library-item-preview">{item.text_preview}</span>
+                      )}
+                    </div>
+                    {item.meta_info && item.status === 'ready' && (
+                      <div className="library-item-tooltip">
+                        {item.meta_info.summary && (
+                          <div className="library-item-tooltip-row">{item.meta_info.summary}</div>
+                        )}
+                        {item.meta_info.keywords && (
+                          <div className="library-item-tooltip-row">
+                            <span className="library-item-tooltip-label">关键词:</span>
+                            {item.meta_info.keywords.join(', ')}
+                          </div>
+                        )}
+                        {item.meta_info.type && (
+                          <div className="library-item-tooltip-row">
+                            <span className="library-item-tooltip-label">类型:</span>
+                            {item.meta_info.type}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
         )}
       </div>

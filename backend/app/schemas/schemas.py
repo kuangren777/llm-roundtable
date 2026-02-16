@@ -100,11 +100,43 @@ class MaterialResponse(BaseModel):
     file_type: str
     mime_type: Optional[str]
     file_size: Optional[int]
+    discussion_id: Optional[int] = None
+    text_preview: Optional[str] = None
+    status: str = "ready"
+    meta_info: Optional[dict] = None
     created_at: datetime
+
+
+class TextPasteRequest(BaseModel):
+    content: str
+
+
+class AttachMaterialsRequest(BaseModel):
+    material_ids: list[int]
 
 
 class UserInputRequest(BaseModel):
     content: str
+
+
+class ObserverChatRequest(BaseModel):
+    content: str
+    provider: str
+    model: str
+    provider_id: Optional[int] = None  # resolve api_key/base_url from LLMProvider table
+
+
+class ObserverMessageResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    role: str
+    content: str
+    created_at: datetime
+
+
+class ObserverEvent(BaseModel):
+    event_type: str  # "chunk" | "done" | "error"
+    content: Optional[str] = None
 
 
 class AgentConfigUpdate(BaseModel):
@@ -135,6 +167,7 @@ class MessageResponse(BaseModel):
     content: str
     summary: Optional[str] = None
     round_number: int
+    cycle_index: int = 0
     phase: Optional[str]
     created_at: datetime
 
@@ -163,6 +196,7 @@ class DiscussionResponse(BaseModel):
 class DiscussionDetail(DiscussionResponse):
     messages: list[MessageResponse] = []
     materials: list[MaterialResponse] = []
+    observer_messages: list[ObserverMessageResponse] = []
 
 
 class DiscussionEvent(BaseModel):
@@ -173,6 +207,8 @@ class DiscussionEvent(BaseModel):
     content: Optional[str] = None
     phase: Optional[str] = None
     round_number: Optional[int] = None
+    cycle_index: Optional[int] = None
+    created_at: Optional[datetime] = None
     # LLM streaming progress fields
     chars_received: Optional[int] = None
     llm_status: Optional[str] = None  # "streaming" | "done"

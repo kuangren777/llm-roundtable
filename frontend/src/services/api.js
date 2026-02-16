@@ -140,6 +140,52 @@ export async function deleteMaterial(discussionId, materialId) {
   if (!res.ok) throw new Error(`Failed to delete material: ${res.statusText}`)
 }
 
+// --- Material Library APIs ---
+
+export async function listLibraryMaterials() {
+  const res = await fetch(`${API_BASE}/materials/`)
+  if (!res.ok) throw new Error(`Failed to list library materials: ${res.statusText}`)
+  return res.json()
+}
+
+export async function pasteTextMaterial(content) {
+  const res = await fetch(`${API_BASE}/materials/paste`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
+  if (!res.ok) throw new Error(`Failed to paste material: ${res.statusText}`)
+  return res.json()
+}
+
+export async function uploadToLibrary(files) {
+  const formData = new FormData()
+  for (const file of files) {
+    formData.append('files', file)
+  }
+  const res = await fetch(`${API_BASE}/materials/upload`, {
+    method: 'POST',
+    body: formData,
+  })
+  if (!res.ok) throw new Error(`Failed to upload to library: ${res.statusText}`)
+  return res.json()
+}
+
+export async function deleteLibraryMaterial(id) {
+  const res = await fetch(`${API_BASE}/materials/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Failed to delete library material: ${res.statusText}`)
+}
+
+export async function attachMaterialsToDiscussion(discussionId, materialIds) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/attach-materials`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ material_ids: materialIds }),
+  })
+  if (!res.ok) throw new Error(`Failed to attach materials: ${res.statusText}`)
+  return res.json()
+}
+
 export async function stopDiscussion(id) {
   const res = await fetch(`${API_BASE}/discussions/${id}/stop`, { method: 'POST' })
   if (!res.ok) throw new Error(`Failed to stop discussion: ${res.statusText}`)
@@ -162,6 +208,21 @@ export async function submitUserInput(discussionId, content) {
   return res.json()
 }
 
+export async function deleteMessage(discussionId, messageId) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/messages/${messageId}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Failed to delete message: ${res.statusText}`)
+}
+
+export async function updateMessage(discussionId, messageId, content) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/messages/${messageId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
+  if (!res.ok) throw new Error(`Failed to update message: ${res.statusText}`)
+  return res.json()
+}
+
 // --- System Settings APIs ---
 
 export async function getSystemSetting(key) {
@@ -178,6 +239,119 @@ export async function setSystemSetting(key, value) {
   })
   if (!res.ok) throw new Error(`Failed to save setting: ${res.statusText}`)
   return res.json()
+}
+
+export async function streamSummarize(id, onEvent, onError, onComplete) {
+  const controller = new AbortController()
+  try {
+    const res = await fetch(`${API_BASE}/discussions/${id}/summarize`, {
+      method: 'POST',
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      onError?.(`Failed to start summarization: ${res.statusText}`)
+      return controller
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop()
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data: ')) continue
+            const jsonStr = trimmed.slice(6)
+            if (!jsonStr) continue
+            try {
+              const event = JSON.parse(jsonStr)
+              if (event.event_type === 'summary_complete') {
+                onComplete?.(event)
+              } else if (event.event_type === 'error') {
+                onError?.(event.content)
+              } else {
+                onEvent?.(event)
+              }
+            } catch {}
+          }
+        }
+        // Stream ended naturally
+      } catch (err) {
+        if (err.name !== 'AbortError') onError?.(err.message || 'Connection lost')
+      }
+    }
+    pump()
+  } catch (err) {
+    if (err.name !== 'AbortError') onError?.(err.message || 'Failed to connect')
+  }
+  return controller
+}
+
+// --- Observer APIs ---
+
+export async function getObserverHistory(discussionId) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/observer/history`)
+  if (!res.ok) throw new Error(`Failed to get observer history: ${res.statusText}`)
+  return res.json()
+}
+
+export async function clearObserverHistory(discussionId) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/observer/history`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Failed to clear observer history: ${res.statusText}`)
+}
+
+export async function streamObserverChat(discussionId, data, onChunk, onError, onDone) {
+  const controller = new AbortController()
+  try {
+    const res = await fetch(`${API_BASE}/discussions/${discussionId}/observer/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+      signal: controller.signal,
+    })
+    if (!res.ok) {
+      onError?.(`Observer chat failed: ${res.statusText}`)
+      return controller
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    const pump = async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop()
+          for (const line of lines) {
+            const trimmed = line.trim()
+            if (!trimmed.startsWith('data: ')) continue
+            const jsonStr = trimmed.slice(6)
+            if (!jsonStr) continue
+            try {
+              const event = JSON.parse(jsonStr)
+              if (event.event_type === 'chunk') onChunk?.(event.content)
+              else if (event.event_type === 'done') onDone?.()
+              else if (event.event_type === 'error') onError?.(event.content)
+            } catch {}
+          }
+        }
+        // Stream ended naturally — treat as done if no explicit done event
+      } catch (err) {
+        if (err.name !== 'AbortError') onError?.(err.message || 'Connection lost')
+      }
+    }
+    pump()
+  } catch (err) {
+    if (err.name !== 'AbortError') onError?.(err.message || 'Failed to connect')
+  }
+  return controller
 }
 
 export async function streamDiscussion(id, onEvent, onError, onComplete) {

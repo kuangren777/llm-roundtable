@@ -50,6 +50,7 @@ class Discussion(Base):
     agents = relationship("AgentConfig", back_populates="discussion", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="discussion", cascade="all, delete-orphan", order_by="Message.created_at")
     materials = relationship("DiscussionMaterial", back_populates="discussion", cascade="all, delete-orphan")
+    observer_messages = relationship("ObserverMessage", back_populates="discussion", cascade="all, delete-orphan", order_by="ObserverMessage.created_at")
 
 
 class AgentConfig(Base):
@@ -98,13 +99,15 @@ class DiscussionMaterial(Base):
     __tablename__ = "discussion_materials"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    discussion_id = Column(Integer, ForeignKey("discussions.id"), nullable=False)
+    discussion_id = Column(Integer, ForeignKey("discussions.id"), nullable=True)  # NULL = library item
     filename = Column(String(255), nullable=False)
     filepath = Column(String(500), nullable=False)
     file_type = Column(String(20), nullable=False)  # "file" | "image"
     mime_type = Column(String(100), nullable=True)
     file_size = Column(Integer, nullable=True)
     text_content = Column(Text, nullable=True)
+    status = Column(String(20), default="ready", nullable=False)  # "processing" | "ready" | "failed"
+    meta_info = Column(JSON, nullable=True)  # LLM-generated metadata (summary, keywords, type)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     discussion = relationship("Discussion", back_populates="materials")
@@ -120,6 +123,7 @@ class Message(Base):
     content = Column(Text, nullable=False)
     summary = Column(Text, nullable=True)
     round_number = Column(Integer, default=0)
+    cycle_index = Column(Integer, default=0, nullable=False)
     phase = Column(String(50), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -132,3 +136,15 @@ class SystemSetting(Base):
     key = Column(String(100), primary_key=True)
     value = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class ObserverMessage(Base):
+    __tablename__ = "observer_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    discussion_id = Column(Integer, ForeignKey("discussions.id"), nullable=False)
+    role = Column(String(20), nullable=False)  # "user" | "observer"
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    discussion = relationship("Discussion", back_populates="observer_messages")

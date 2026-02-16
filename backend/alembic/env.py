@@ -8,9 +8,14 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from app.database import Base
-from app.models.models import Discussion, AgentConfig, Message, DiscussionMaterial, SystemSetting  # noqa: F401
+from app.config import get_settings
+from app.models.models import Discussion, AgentConfig, Message, DiscussionMaterial, SystemSetting, ObserverMessage  # noqa: F401
 
 config = context.config
+
+# Override alembic.ini URL with the absolute path from config.py
+config.set_main_option("sqlalchemy.url", get_settings().database_url)
+
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 

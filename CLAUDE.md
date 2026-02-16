@@ -226,3 +226,79 @@ Multi-agent discussion platform implementing the "Intelligent Round Table Host P
 - Updated `unit_test/test_discussion_engine.py` — replaced VERDICT tests with pure round-counting tests (ignores_verdict, multi_round_continues, single_round)
 - Added `TestUserInputRequest` (3 tests) to `unit_test/test_schemas.py`
 - Total: 100 tests passing
+
+### Session 10 (2026-02-16)
+**Goal:** Text paste material + global material library
+
+**Architecture change:** `DiscussionMaterial.discussion_id` made nullable — `NULL` = library item, `int` = discussion-scoped. No new tables. Library items stored in `uploads/library/`, survive discussion deletion. When files are uploaded to a discussion, library copies are auto-created. Pasted text calls LLM to generate a short Chinese filename, saved as `.md`.
+
+**Changes made:**
+- Made `discussion_id` nullable in `backend/app/models/models.py` — library items have `discussion_id=NULL`
+- Created Alembic migration `f6a7b8c9d0e1_material_library.py` — `batch_alter_table` for SQLite compat
+- Added `TextPasteRequest`, `AttachMaterialsRequest`, `text_preview` field to `MaterialResponse` in `backend/app/schemas/schemas.py`
+- Added 6 service functions to `backend/app/services/discussion_service.py`: `generate_material_filename()`, `save_text_material()`, `list_library_materials()`, `delete_library_material()`, `attach_library_materials()`, `upload_to_library()`
+- Modified `upload_materials()` to auto-create library copies (best-effort)
+- Created `backend/app/api/materials.py` — 4 endpoints: `GET /api/materials/`, `POST /api/materials/paste`, `POST /api/materials/upload`, `DELETE /api/materials/{id}`
+- Added `POST /api/discussions/{id}/attach-materials` endpoint in `backend/app/api/discussions.py`
+- Registered `materials_router` in `backend/app/main.py`
+- Added 5 API functions to `frontend/src/services/api.js`: `listLibraryMaterials`, `pasteTextMaterial`, `uploadToLibrary`, `deleteLibraryMaterial`, `attachMaterialsToDiscussion`
+- Rewrote `frontend/src/pages/CreatePage.jsx` — tabbed material section (上传文件 | 粘贴文本 | 素材库) with search, checkbox selection, auto-attach on submit
+- Added material-tabs, paste-section, library-list/item/search CSS to `frontend/src/styles/index.css`
+- Total: 100 tests passing
+
+### Session 11 (2026-02-16)
+**Goal:** Auto-summarize with progress display — batch summarize unsummarized messages via SSE
+
+**Bug fix:** Ran `alembic upgrade head` to apply the `e5f6a7b8c9d0` migration that added `summary` column to Message table (was causing `no such column: messages.summary` error).
+
+**Changes made:**
+- Added `summarize_discussion_messages()` async generator to `backend/app/services/discussion_service.py` — queries unsummarized long messages, calls `call_llm()` sequentially with progress events (`summary_progress`, `summary_done`, `summary_complete`)
+- Added `POST /api/discussions/{id}/summarize` SSE endpoint to `backend/app/api/discussions.py`
+- Added `streamSummarize()` to `frontend/src/services/api.js` — POST-based SSE via fetch+ReadableStream (same pattern as `streamDiscussion`)
+- Updated `frontend/src/pages/DiscussionPage.jsx` — `summarizing`/`summaryProgress` state, `unsummarizedCount` derived from messages, "生成总结 (N条)" button in header controls (visible when completed/waiting_input), progress text during summarization, message state updates on `summary_done` events
+- Added `.summary-btn` and `.summary-progress` CSS to `frontend/src/styles/index.css`
+- Total: 100 tests passing
+
+### Session 12 (2026-02-16)
+**Goal:** Fix paste material 500 error + async processing with metadata
+
+**Bug fix:** `save_text_material()` used `datetime.now(timezone.utc)` but never imported `datetime`/`timezone` → `NameError` → 500. Added `from datetime import datetime, timezone` to `discussion_service.py`.
+
+**Architecture change:** Paste-to-library is now async. `save_text_material()` returns immediately with `status="processing"` and a placeholder filename. A background `asyncio.create_task` generates the LLM filename + metadata, then updates the DB row to `status="ready"`. Frontend polls every 2s while items are processing, and shows a metadata tooltip on hover.
+
+**SQLAlchemy gotcha:** `metadata` is a reserved attribute name on `DeclarativeBase` — renamed to `meta_info` across all layers.
+
+**Changes made:**
+- Fixed missing `from datetime import datetime, timezone` import in `backend/app/services/discussion_service.py`
+- Added `status` (String, default "ready") and `meta_info` (JSON, nullable) columns to `DiscussionMaterial` in `backend/app/models/models.py`
+- Added `status`, `meta_info` fields to `MaterialResponse` in `backend/app/schemas/schemas.py`
+- Created Alembic migration `g7b8c9d0e1f2_material_status_metadata.py`
+- Rewrote `save_text_material()` — saves placeholder immediately, spawns `_process_material_bg()` background task
+- Added `generate_material_metadata()` — LLM generates summary/keywords/type JSON
+- Added `_process_material_bg()` — background task: generates filename + metadata, renames file, updates DB; sets `status="failed"` on error
+- Updated `frontend/src/pages/CreatePage.jsx` — polling `useEffect` while items are processing, processing/failed indicators in library list, metadata tooltip on hover
+- Added `.processing-indicator`, `.failed-indicator`, `.library-item-tooltip` CSS to `frontend/src/styles/index.css`
+- Total: 100 tests passing
+
+### Session 13 (2026-02-16)
+**Goal:** Independent observer chat panel — a side panel where an LLM observes the full discussion and answers user questions in real time
+
+**Architecture change:** New `ObserverMessage` table (separate from `Message` — no agent_name/round_number/phase fields). Observer chat uses the same `asyncio.Queue` + `create_task` streaming pattern as `run_discussion`, with `call_llm_stream` pushing chunks into the queue. The observer's system prompt includes the full discussion context (all messages + final summary) so it can analyze the debate.
+
+**Changes made:**
+- Added `ObserverMessage` model to `backend/app/models/models.py` — id, discussion_id FK, role ("user"|"observer"), content, created_at
+- Added `observer_messages` relationship on `Discussion` with cascade delete
+- Created Alembic migration `i9d0e1f2a3b4_add_observer_messages.py`
+- Updated `backend/alembic/env.py` — imported `ObserverMessage`
+- Added `ObserverChatRequest`, `ObserverMessageResponse`, `ObserverEvent` schemas to `backend/app/schemas/schemas.py`
+- Added `observer_messages` field to `DiscussionDetail` schema
+- Created `backend/app/services/observer_service.py` — `get_observer_history()`, `clear_observer_history()`, `chat_with_observer()` (streaming async generator)
+- Created `backend/app/api/observer.py` — 3 endpoints: GET/DELETE history, POST chat (SSE)
+- Registered `observer_router` in `backend/app/main.py`
+- Updated `get_discussion()` in `discussion_service.py` — added `selectinload(Discussion.observer_messages)`
+- Added `getObserverHistory`, `clearObserverHistory`, `streamObserverChat` to `frontend/src/services/api.js`
+- Added `ObserverPanel` component to `frontend/src/pages/DiscussionPage.jsx` — collapsible right panel (360px), provider/model selector, streaming chat with typing cursor animation
+- Wrapped discussion page in `discussion-page-wrapper` flex container for side-by-side layout
+- Added observer CSS styles (panel, messages, config, input bar, typing cursor) to `frontend/src/styles/index.css`
+- Added 4 observer tests to `unit_test/test_api.py`: empty history, error for missing discussion, clear history, observer_messages in detail
+- Total: 113 tests passing
