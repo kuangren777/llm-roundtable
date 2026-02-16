@@ -37,12 +37,14 @@ async def call_llm(
     base_url: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 2000,
+    timeout: float = 120,
 ) -> str:
     """Call an LLM via the OpenAI-compatible chat completions API."""
     normalized_url = _normalize_base_url(base_url)
     client = AsyncOpenAI(
         api_key=api_key or "sk-placeholder",
         base_url=normalized_url,
+        timeout=timeout,
     )
 
     response = await client.chat.completions.create(
@@ -74,12 +76,14 @@ async def call_llm_stream(
     temperature: float = 0.7,
     max_tokens: int = 2000,
     on_chunk=None,  # async callback(chunk_text: str, total_chars: int)
+    timeout: float = 120,
 ) -> tuple[str, int]:
     """Streaming LLM call with on_chunk progress callback. Returns (full_text, total_chars)."""
     normalized_url = _normalize_base_url(base_url)
     client = AsyncOpenAI(
         api_key=api_key or "sk-placeholder",
         base_url=normalized_url,
+        timeout=timeout,
     )
 
     stream = await client.chat.completions.create(

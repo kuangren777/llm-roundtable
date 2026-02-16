@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
-from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse
+from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse, UserInputRequest
 
 logger = logging.getLogger(__name__)
 from ..services.discussion_service import (
@@ -16,6 +16,9 @@ from ..services.discussion_service import (
     list_discussions,
     delete_discussion,
     run_discussion,
+    stop_discussion,
+    complete_discussion,
+    submit_user_input,
     update_agent,
     prepare_agents,
     generate_title,
@@ -99,6 +102,34 @@ async def run_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends
             logger.info("SSE stream closed for discussion %d", discussion_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@router.post("/{discussion_id}/stop")
+async def stop_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
+    """Stop a running discussion — cancels the graph task and resets status."""
+    ok = await stop_discussion(db, discussion_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    return {"status": "stopped"}
+
+
+@router.post("/{discussion_id}/complete")
+async def complete_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
+    """Manually mark a discussion as completed (end the cyclic loop)."""
+    ok = await complete_discussion(db, discussion_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    return {"status": "completed"}
+
+
+@router.post("/{discussion_id}/user-input")
+async def user_input_endpoint(discussion_id: int, data: UserInputRequest, db: AsyncSession = Depends(get_db)):
+    """Submit a user message into a running discussion."""
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    msg = await submit_user_input(db, discussion_id, data.content)
+    return {"id": msg.id, "content": msg.content}
 
 
 # --- Material endpoints ---

@@ -103,6 +103,10 @@ class MaterialResponse(BaseModel):
     created_at: datetime
 
 
+class UserInputRequest(BaseModel):
+    content: str
+
+
 class AgentConfigUpdate(BaseModel):
     name: Optional[str] = None
     persona: Optional[str] = None
@@ -110,6 +114,7 @@ class AgentConfigUpdate(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
+    provider_id: Optional[int] = None  # Precise provider lookup (avoids type ambiguity)
 
 
 class DiscussionCreate(BaseModel):

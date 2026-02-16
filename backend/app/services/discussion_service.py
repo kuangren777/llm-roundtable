@@ -1,6 +1,7 @@
 """Discussion service — orchestrates DB operations and the LangGraph engine."""
 import asyncio
 import json
+import logging
 import os
 import shutil
 from typing import AsyncGenerator
@@ -11,14 +12,23 @@ from fastapi import UploadFile
 
 from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole
 from ..schemas.schemas import DiscussionCreate, AgentConfigUpdate, DiscussionEvent
-from .discussion_engine import build_discussion_graph, AgentInfo, DiscussionState, progress_queue_var
+from ..database import async_session
+from .discussion_engine import build_discussion_graph, AgentInfo, DiscussionState, progress_queue_var, _pending_user_messages
 from .mode_templates import get_mode_template, assign_llms_to_agents
 from .planner import plan_agents
 from .llm_service import call_llm
 
+logger = logging.getLogger(__name__)
+
 GRAPH_EVENT = "graph_event"
 PROGRESS_EVENT = "progress_event"
+USER_MSG_CONSUMED = "user_message_consumed"
 GRAPH_DONE = "graph_done"
+
+# Track running graph tasks so they can be cancelled by the stop endpoint
+_running_tasks: dict[int, asyncio.Task] = {}
+# Track drain tasks (background DB writers after SSE disconnect)
+_drain_tasks: dict[int, asyncio.Task] = {}
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -134,8 +144,32 @@ async def update_agent(db: AsyncSession, discussion_id: int, agent_id: int, data
     agent = result.scalar_one_or_none()
     if not agent:
         return None
-    for field, value in data.model_dump(exclude_unset=True).items():
+
+    updates = data.model_dump(exclude_unset=True)
+    # Don't let frontend overwrite api_key/base_url — resolve from provider table
+    updates.pop("api_key", None)
+    updates.pop("base_url", None)
+    # Extract provider_id before applying updates (not an AgentConfig column)
+    provider_id = updates.pop("provider_id", None)
+    for field, value in updates.items():
         setattr(agent, field, value)
+
+    # Auto-resolve api_key and base_url from LLMProvider
+    # Prefer provider_id (precise) over provider type (ambiguous with multiple same-type providers)
+    if provider_id:
+        prov_result = await db.execute(
+            select(LLMProvider).where(LLMProvider.id == provider_id)
+        )
+    else:
+        target_provider = updates.get("provider", agent.provider)
+        prov_result = await db.execute(
+            select(LLMProvider).where(LLMProvider.provider == target_provider)
+        )
+    prov = prov_result.scalar_one_or_none()
+    if prov:
+        agent.api_key = prov.api_key
+        agent.base_url = prov.base_url
+
     await db.commit()
     await db.refresh(agent)
     return agent
@@ -347,9 +381,12 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         yield DiscussionEvent(event_type="error", content="Discussion already completed")
         return
 
-    if discussion.status not in (DiscussionStatus.CREATED, DiscussionStatus.FAILED):
+    if discussion.status not in (DiscussionStatus.CREATED, DiscussionStatus.FAILED, DiscussionStatus.WAITING_INPUT):
         yield DiscussionEvent(event_type="error", content="Discussion is already running")
         return
+
+    # Continuing from WAITING_INPUT — keep messages, reset round counter for new cycle
+    resuming = discussion.status == DiscussionStatus.WAITING_INPUT
 
     # Retry cleanup: clear old messages and reset round counter
     if discussion.status == DiscussionStatus.FAILED:
@@ -405,11 +442,22 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
     # Build materials text from uploaded files
     materials_text = _build_materials_text(list(discussion.materials)) if discussion.materials else ""
 
-    # Initialize state
+    # Initialize state — when resuming, carry over previous messages for context
+    prior_messages = []
+    if resuming and discussion.messages:
+        for m in discussion.messages:
+            prior_messages.append({
+                "agent_name": m.agent_name,
+                "agent_role": m.agent_role,
+                "content": m.content,
+                "round_number": m.round_number,
+                "phase": m.phase or "",
+            })
+
     initial_state: DiscussionState = {
         "topic": discussion.topic,
         "agents": agents,
-        "messages": [],
+        "messages": prior_messages,
         "current_round": 0,
         "max_rounds": discussion.max_rounds,
         "host_plan": "",
@@ -419,6 +467,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         "materials": materials_text,
         "phase": "planning",
         "error": None,
+        "discussion_id": discussion_id,
     }
 
     discussion.status = DiscussionStatus.PLANNING
@@ -442,6 +491,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
             await queue.put((GRAPH_DONE, None))
 
     task = asyncio.create_task(_run_graph())
+    _running_tasks[discussion_id] = task
 
     try:
         while True:
@@ -458,6 +508,16 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                     chars_received=payload["chars"],
                     llm_status=payload["status"],
                     phase=payload.get("phase", ""),
+                )
+                continue
+
+            if msg_type == USER_MSG_CONSUMED:
+                # Notify frontend that a user message was consumed by the engine
+                yield DiscussionEvent(
+                    event_type="user_message_consumed",
+                    agent_name=payload.get("agent_name", "用户"),
+                    content=payload.get("content", ""),
+                    phase="user_input",
                 )
                 continue
 
@@ -520,9 +580,9 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                 discussion.current_round = node_output.get("current_round", discussion.current_round)
                 await db.commit()
 
-        discussion.status = DiscussionStatus.COMPLETED
+        discussion.status = DiscussionStatus.WAITING_INPUT
         await db.commit()
-        yield DiscussionEvent(event_type="complete", content="Discussion completed successfully")
+        yield DiscussionEvent(event_type="cycle_complete", content="本轮讨论结束，等待您的输入后继续...")
 
     except Exception as e:
         task.cancel()
@@ -530,16 +590,179 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         await db.commit()
         yield DiscussionEvent(event_type="error", content=f"Discussion failed: {str(e)}")
     finally:
+        _pending_user_messages.pop(discussion_id, None)
         progress_queue_var.reset(token)
-        # Guard against client disconnect (GeneratorExit) leaving status stuck
+
+        # If the graph task is still running (e.g. SSE client disconnected),
+        # spawn a background drain task to keep saving messages to DB.
+        if not task.done():
+            logger.info("SSE disconnected for discussion %d — spawning drain task", discussion_id)
+            drain = asyncio.create_task(_drain_queue(discussion_id, queue, task))
+            _drain_tasks[discussion_id] = drain
+        else:
+            # Task finished normally — clean up
+            _running_tasks.pop(discussion_id, None)
+            try:
+                await db.refresh(discussion)
+                if discussion.status not in (
+                    DiscussionStatus.COMPLETED,
+                    DiscussionStatus.FAILED,
+                    DiscussionStatus.CREATED,
+                    DiscussionStatus.WAITING_INPUT,
+                ):
+                    discussion.status = DiscussionStatus.FAILED
+                    await db.commit()
+            except Exception:
+                pass
+
+
+async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asyncio.Task):
+    """Background task: keep reading the graph queue and saving messages to DB
+    after the SSE client has disconnected. Uses its own DB session."""
+    try:
+        async with async_session() as db:
+            result = await db.execute(
+                select(Discussion).where(Discussion.id == discussion_id)
+            )
+            discussion = result.scalar_one_or_none()
+            if not discussion:
+                graph_task.cancel()
+                return
+
+            while True:
+                msg_type, payload = await queue.get()
+
+                if msg_type == GRAPH_DONE:
+                    break
+
+                if msg_type == PROGRESS_EVENT:
+                    continue  # no SSE consumer — skip progress events
+
+                if msg_type == USER_MSG_CONSUMED:
+                    continue
+
+                # GRAPH_EVENT
+                if "_error" in payload:
+                    discussion.status = DiscussionStatus.FAILED
+                    await db.commit()
+                    return
+
+                for node_name, node_output in payload.items():
+                    phase = node_output.get("phase", "")
+                    error = node_output.get("error")
+
+                    if error:
+                        discussion.status = DiscussionStatus.FAILED
+                        await db.commit()
+                        return
+
+                    if phase == "planning":
+                        discussion.status = DiscussionStatus.PLANNING
+                    elif phase == "discussing":
+                        discussion.status = DiscussionStatus.DISCUSSING
+                    elif phase == "reflecting":
+                        discussion.status = DiscussionStatus.REFLECTING
+                    elif phase == "synthesizing":
+                        discussion.status = DiscussionStatus.SYNTHESIZING
+
+                    for msg_data in node_output.get("messages", []):
+                        db.add(Message(
+                            discussion_id=discussion_id,
+                            agent_name=msg_data["agent_name"],
+                            agent_role=msg_data["agent_role"],
+                            content=msg_data["content"],
+                            round_number=msg_data.get("round_number", 0),
+                            phase=msg_data.get("phase", ""),
+                        ))
+
+                    if node_output.get("final_summary"):
+                        discussion.final_summary = node_output["final_summary"]
+
+                    discussion.current_round = node_output.get("current_round", discussion.current_round)
+                    await db.commit()
+
+            # Graph finished — set final status
+            discussion.status = DiscussionStatus.WAITING_INPUT
+            await db.commit()
+            logger.info("Drain task completed for discussion %d", discussion_id)
+
+    except Exception as e:
+        logger.warning("Drain task error for discussion %d: %s", discussion_id, e)
         try:
-            await db.refresh(discussion)
-            if discussion.status not in (
-                DiscussionStatus.COMPLETED,
-                DiscussionStatus.FAILED,
-                DiscussionStatus.CREATED,
-            ):
-                discussion.status = DiscussionStatus.FAILED
-                await db.commit()
+            async with async_session() as db:
+                result = await db.execute(
+                    select(Discussion).where(Discussion.id == discussion_id)
+                )
+                disc = result.scalar_one_or_none()
+                if disc and disc.status not in (
+                    DiscussionStatus.COMPLETED, DiscussionStatus.FAILED,
+                    DiscussionStatus.CREATED, DiscussionStatus.WAITING_INPUT,
+                ):
+                    disc.status = DiscussionStatus.FAILED
+                    await db.commit()
         except Exception:
-            pass  # DB session may already be closed
+            pass
+    finally:
+        _running_tasks.pop(discussion_id, None)
+        _drain_tasks.pop(discussion_id, None)
+
+
+async def stop_discussion(db: AsyncSession, discussion_id: int) -> bool:
+    """Cancel a running discussion: kill the graph task, drain task, and reset status."""
+    task = _running_tasks.pop(discussion_id, None)
+    if task and not task.done():
+        task.cancel()
+    drain = _drain_tasks.pop(discussion_id, None)
+    if drain and not drain.done():
+        drain.cancel()
+
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        return False
+
+    if discussion.status not in (
+        DiscussionStatus.COMPLETED,
+        DiscussionStatus.FAILED,
+        DiscussionStatus.CREATED,
+        DiscussionStatus.WAITING_INPUT,
+    ):
+        discussion.status = DiscussionStatus.FAILED
+        await db.commit()
+    return True
+
+
+async def complete_discussion(db: AsyncSession, discussion_id: int) -> bool:
+    """Manually mark a discussion as completed (end the cyclic loop)."""
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        return False
+    discussion.status = DiscussionStatus.COMPLETED
+    await db.commit()
+    return True
+
+
+async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) -> Message:
+    """Submit a user message into a running discussion.
+
+    The message is saved to DB immediately and queued for injection
+    into the next host_planning_node round.
+    """
+    msg = Message(
+        discussion_id=discussion_id,
+        agent_name="用户",
+        agent_role=AgentRole.USER,
+        content=content,
+        round_number=0,
+        phase="user_input",
+    )
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+
+    # Append to pending queue for engine consumption
+    _pending_user_messages.setdefault(discussion_id, []).append({
+        "agent_name": "用户",
+        "content": content,
+    })
+
+    return msg

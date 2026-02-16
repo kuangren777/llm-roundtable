@@ -17,6 +17,7 @@ from backend.app.schemas.schemas import (
     LLMModelCreate,
     LLMModelUpdate,
     LLMModelResponse,
+    UserInputRequest,
 )
 from backend.app.models.models import AgentRole
 
@@ -178,3 +179,18 @@ class TestLLMModelUpdate:
         u = LLMModelUpdate(name="New Name")
         assert u.name == "New Name"
         assert u.model is None
+
+
+class TestUserInputRequest:
+    def test_valid(self):
+        r = UserInputRequest(content="I think we should consider X")
+        assert r.content == "I think we should consider X"
+
+    def test_missing_content_fails(self):
+        with pytest.raises(ValidationError):
+            UserInputRequest()
+
+    def test_empty_string_allowed(self):
+        """Empty string is technically valid — API layer can reject if needed."""
+        r = UserInputRequest(content="")
+        assert r.content == ""

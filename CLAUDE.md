@@ -205,3 +205,24 @@ Multi-agent discussion platform implementing the "Intelligent Round Table Host P
 - Added `llmProgress` state + `llm_progress` SSE handler + `LLMProgressBar` component to `frontend/src/pages/DiscussionPage.jsx`
 - Added `.llm-progress` / `.llm-progress-item` / `.llm-progress-chars` / `progress-pulse` animation CSS to `frontend/src/styles/index.css`
 - Total: 95 tests passing
+
+### Session 9 (2026-02-15)
+**Goal:** Fix multi-round bug + non-blocking user input during discussions
+
+**Bug fix:** Critic prompt included `VERDICT: SYNTHESIZE` instruction, causing LLMs to short-circuit on round 1. Removed VERDICT mechanism entirely — `should_continue_or_synthesize` now uses pure round counting.
+
+**Architecture change:** Non-blocking user message injection. Module-level `_pending_user_messages` dict (keyed by discussion_id) holds queued messages. `host_planning_node` consumes all pending messages at the start of each round, injecting them into `state.messages`. Frontend shows a persistent input bar during running discussions with optimistic updates.
+
+**Changes made:**
+- Fixed `backend/app/services/discussion_engine.py` — removed VERDICT from critic prompt, removed VERDICT check from `should_continue_or_synthesize`, added `_pending_user_messages` dict, added `discussion_id` to `DiscussionState`, `host_planning_node` consumes pending user messages and emits `user_message_consumed` events
+- Added `USER = "user"` to `AgentRole` enum in `backend/app/models/models.py`
+- Added `UserInputRequest` schema to `backend/app/schemas/schemas.py`
+- Added `submit_user_input()` to `backend/app/services/discussion_service.py` — saves to DB + queues for engine; cleanup in finally block
+- Updated `run_discussion()` — passes `discussion_id` in initial state, handles `user_message_consumed` queue events
+- Added `POST /{id}/user-input` endpoint in `backend/app/api/discussions.py`
+- Added `submitUserInput()` to `frontend/src/services/api.js`
+- Updated `frontend/src/pages/DiscussionPage.jsx` — user input bar (Ctrl+Enter), optimistic message display, `MessageBubble` supports `role-user` with 👤 icon
+- Added `.user-input-bar`, `.message-bubble.role-user` CSS in `frontend/src/styles/index.css`
+- Updated `unit_test/test_discussion_engine.py` — replaced VERDICT tests with pure round-counting tests (ignores_verdict, multi_round_continues, single_round)
+- Added `TestUserInputRequest` (3 tests) to `unit_test/test_schemas.py`
+- Total: 100 tests passing

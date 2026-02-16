@@ -140,6 +140,28 @@ export async function deleteMaterial(discussionId, materialId) {
   if (!res.ok) throw new Error(`Failed to delete material: ${res.statusText}`)
 }
 
+export async function stopDiscussion(id) {
+  const res = await fetch(`${API_BASE}/discussions/${id}/stop`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to stop discussion: ${res.statusText}`)
+  return res.json()
+}
+
+export async function completeDiscussion(id) {
+  const res = await fetch(`${API_BASE}/discussions/${id}/complete`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to complete discussion: ${res.statusText}`)
+  return res.json()
+}
+
+export async function submitUserInput(discussionId, content) {
+  const res = await fetch(`${API_BASE}/discussions/${discussionId}/user-input`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content }),
+  })
+  if (!res.ok) throw new Error(`Failed to submit user input: ${res.statusText}`)
+  return res.json()
+}
+
 export async function streamDiscussion(id, onEvent, onError, onComplete) {
   const controller = new AbortController()
 
@@ -176,7 +198,7 @@ export async function streamDiscussion(id, onEvent, onError, onComplete) {
 
             try {
               const event = JSON.parse(jsonStr)
-              if (event.event_type === 'complete') {
+              if (event.event_type === 'complete' || event.event_type === 'cycle_complete') {
                 onComplete?.(event)
               } else if (event.event_type === 'error') {
                 onError?.(event.content)

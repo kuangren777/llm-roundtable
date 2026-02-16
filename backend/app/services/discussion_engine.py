@@ -16,6 +16,9 @@ progress_queue_var: contextvars.ContextVar[asyncio.Queue | None] = contextvars.C
     'progress_queue', default=None
 )
 
+# Per-discussion pending user messages (non-blocking injection)
+_pending_user_messages: dict[int, list[dict]] = {}
+
 
 class AgentInfo(TypedDict):
     name: str
@@ -40,6 +43,7 @@ class DiscussionState(TypedDict):
     materials: str  # formatted reference materials text
     phase: str
     error: Optional[str]
+    discussion_id: int
 
 
 def _get_agent_by_role(agents: list[AgentInfo], role: str) -> Optional[AgentInfo]:
@@ -85,13 +89,21 @@ async def _call_with_progress(agent: AgentInfo, messages: list[dict], phase: str
             **kwargs,
         )
 
+    # Emit "waiting" event immediately so frontend shows feedback before first token
+    await queue.put(("progress_event", {
+        "agent_name": agent["name"],
+        "chars": 0,
+        "status": "waiting",
+        "phase": phase,
+    }))
+
     chunk_count = 0
 
     async def on_chunk(delta: str, total_chars: int):
         nonlocal chunk_count
         chunk_count += 1
-        # Throttle: emit progress every 5 chunks
-        if chunk_count % 5 == 0:
+        # Emit first chunk immediately, then throttle every 5 chunks
+        if chunk_count == 1 or chunk_count % 5 == 0:
             await queue.put(("progress_event", {
                 "agent_name": agent["name"],
                 "chars": total_chars,
@@ -125,6 +137,24 @@ async def host_planning_node(state: DiscussionState) -> dict:
     host = _get_agent_by_role(state["agents"], AgentRole.HOST)
     if not host:
         return {"error": "No host agent configured", "phase": "error"}
+
+    # Consume pending user messages (non-blocking injection)
+    discussion_id = state.get("discussion_id", 0)
+    user_msgs = _pending_user_messages.pop(discussion_id, [])
+    injected_messages = []
+    queue = progress_queue_var.get(None)
+    for um in user_msgs:
+        msg_data = {
+            "agent_name": um.get("agent_name", "用户"),
+            "agent_role": AgentRole.USER,
+            "content": um["content"],
+            "round_number": state["current_round"],
+            "phase": "user_input",
+        }
+        injected_messages.append(msg_data)
+        # Notify frontend that the message was consumed
+        if queue:
+            await queue.put(("user_message_consumed", msg_data))
 
     panelists = _get_agents_by_role(state["agents"], AgentRole.PANELIST)
     panelist_desc = "\n".join(
@@ -187,16 +217,17 @@ Based on the critic's feedback and gaps identified, create follow-up questions f
             ],
             phase="planning",
         )
+        host_msg = {
+            "agent_name": host["name"],
+            "agent_role": AgentRole.HOST,
+            "content": plan,
+            "round_number": state["current_round"],
+            "phase": "planning",
+        }
         return {
             "host_plan": plan,
             "phase": "planning",
-            "messages": [{
-                "agent_name": host["name"],
-                "agent_role": AgentRole.HOST,
-                "content": plan,
-                "round_number": state["current_round"],
-                "phase": "planning",
-            }],
+            "messages": injected_messages + [host_msg],
         }
     except Exception as e:
         return {"error": f"Host planning failed: {str(e)}", "phase": "error"}
@@ -273,17 +304,14 @@ Current round: {state['current_round'] + 1} of {state['max_rounds']}
 Full discussion so far:
 {history}
 
-Analyze the discussion and identify:
+Analyze the discussion and provide constructive feedback:
 1. **Contradictions**: Where do panelists disagree? Are these resolved?
 2. **Blind spots**: What important aspects haven't been addressed?
 3. **Logical gaps**: Are there unsupported claims or weak reasoning?
 4. **Missing perspectives**: What viewpoints are absent?
+5. **Suggestions**: What specific questions or angles should the next round explore?
 
-If this is the final round or the discussion is sufficiently thorough, indicate that synthesis can proceed.
-
-End with either:
-- "VERDICT: CONTINUE" (if more discussion is needed)
-- "VERDICT: SYNTHESIZE" (if ready for final summary)"""
+Focus on actionable feedback that will improve the next round of discussion."""
 
     try:
         feedback = await _call_with_progress(
@@ -320,13 +348,14 @@ End with either:
 
 
 def should_continue_or_synthesize(state: DiscussionState) -> str:
-    """Decide whether to continue iterating or move to synthesis."""
+    """Decide whether to continue iterating or move to synthesis.
+
+    Pure round-counting — no VERDICT parsing. This prevents the LLM from
+    short-circuiting multi-round discussions by outputting SYNTHESIZE early.
+    """
     if state.get("error"):
         return "synthesize"
     if state["current_round"] >= state["max_rounds"] - 1:
-        return "synthesize"
-    feedback = state.get("critic_feedback", "")
-    if "VERDICT: SYNTHESIZE" in feedback.upper():
         return "synthesize"
     return "continue"
 

@@ -53,7 +53,7 @@ class TestCallLlm:
             )
 
             # _normalize_base_url appends /v1 when path is empty
-            MockClient.assert_called_once_with(api_key="sk-ds", base_url="https://api.deepseek.com/v1")
+            MockClient.assert_called_once_with(api_key="sk-ds", base_url="https://api.deepseek.com/v1", timeout=120)
 
     @pytest.mark.asyncio
     async def test_gemini_via_openai_compat(self):
@@ -80,6 +80,7 @@ class TestCallLlm:
             MockClient.assert_called_once_with(
                 api_key="AIza-test",
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+                timeout=120,
             )
 
     @pytest.mark.asyncio
@@ -100,7 +101,7 @@ class TestCallLlm:
                 api_key="sk-test",
             )
 
-            MockClient.assert_called_once_with(api_key="sk-test", base_url=None)
+            MockClient.assert_called_once_with(api_key="sk-test", base_url=None, timeout=120)
 
     @pytest.mark.asyncio
     async def test_no_api_key_uses_placeholder(self):
@@ -120,4 +121,4 @@ class TestCallLlm:
                 base_url="http://localhost:11434/v1",
             )
 
-            MockClient.assert_called_once_with(api_key="sk-placeholder", base_url="http://localhost:11434/v1")
+            MockClient.assert_called_once_with(api_key="sk-placeholder", base_url="http://localhost:11434/v1", timeout=120)

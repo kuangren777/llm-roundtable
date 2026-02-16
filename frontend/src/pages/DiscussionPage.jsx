@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { getDiscussion, streamDiscussion, prepareAgents, updateAgent, listLLMProviders } from '../services/api'
+import { getDiscussion, streamDiscussion, stopDiscussion, prepareAgents, updateAgent, listLLMProviders, submitUserInput } from '../services/api'
 
 const PHASE_LABELS = {
   planning: '规划中',
@@ -12,6 +12,7 @@ const ROLE_LABELS = {
   host: '主持人',
   panelist: '专家',
   critic: '批评家',
+  user: '用户',
 }
 
 export default function DiscussionPage({ discussionId }) {
@@ -24,12 +25,41 @@ export default function DiscussionPage({ discussionId }) {
   const [providers, setProviders] = useState([])
   const [preparingAgents, setPreparingAgents] = useState(false)
   const [llmProgress, setLlmProgress] = useState()
+  const [userInput, setUserInput] = useState('')
+  const [sendingInput, setSendingInput] = useState(false)
   const streamRef = useRef(null)
   const messagesEndRef = useRef(null)
+
+  const pollRef = useRef(null)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  // Poll for updates when discussion is running (e.g. after page refresh)
+  const startPolling = useCallback(() => {
+    if (pollRef.current) return
+    pollRef.current = setInterval(async () => {
+      try {
+        const d = await getDiscussion(discussionId)
+        setMessages(d.messages || [])
+        setPhase(d.status)
+        setAgents(d.agents || [])
+        if (d.final_summary) {
+          setDiscussion(prev => ({ ...prev, final_summary: d.final_summary }))
+        }
+        const RUNNING = ['planning', 'discussing', 'reflecting', 'synthesizing']
+        if (!RUNNING.includes(d.status)) {
+          // Discussion finished while we were polling
+          clearInterval(pollRef.current)
+          pollRef.current = null
+          if (d.status === 'completed') setStatus('completed')
+          else if (d.status === 'waiting_input') setStatus('waiting_input')
+          else if (d.status === 'failed') { setStatus('error'); setError('讨论执行失败') }
+        }
+      } catch {}
+    }, 2500)
+  }, [discussionId])
 
   // Load discussion + providers on mount
   useEffect(() => {
@@ -44,8 +74,12 @@ export default function DiscussionPage({ discussionId }) {
         setPhase(d.status)
         setProviders(provs)
 
+        const RUNNING = ['planning', 'discussing', 'reflecting', 'synthesizing']
         if (d.status === 'completed') {
           setStatus('completed')
+          setAgents(d.agents || [])
+        } else if (d.status === 'waiting_input') {
+          setStatus('waiting_input')
           setAgents(d.agents || [])
         } else if (d.status === 'failed') {
           setStatus('error')
@@ -68,6 +102,11 @@ export default function DiscussionPage({ discussionId }) {
           } else {
             setAgents(d.agents)
           }
+        } else if (RUNNING.includes(d.status)) {
+          // Discussion is running (e.g. page refresh) — poll for updates
+          setStatus('running')
+          setAgents(d.agents || [])
+          startPolling()
         } else {
           setStatus('running')
           setAgents(d.agents || [])
@@ -78,8 +117,11 @@ export default function DiscussionPage({ discussionId }) {
       }
     }
     load()
-    return () => { streamRef.current?.abort() }
-  }, [discussionId])
+    return () => {
+      streamRef.current?.abort()
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+    }
+  }, [discussionId, startPolling])
 
   const startDiscussion = async () => {
     setStatus('running')
@@ -123,13 +165,22 @@ export default function DiscussionPage({ discussionId }) {
         }
       },
       (errMsg) => { setStatus('error'); setError(errMsg) },
-      () => {
-        setStatus('completed')
+      (evt) => {
         setLlmProgress(null)
+        setStatus('waiting_input')
         getDiscussion(discussionId).then(d => setDiscussion(d))
       },
     )
     streamRef.current = controller
+  }
+
+  const handleReplan = async () => {
+    streamRef.current?.abort()
+    try { await stopDiscussion(discussionId) } catch {}
+    setMessages([])
+    setLlmProgress(null)
+    setError(null)
+    startDiscussion()
   }
 
   const handleAgentSave = useCallback(async (agentId, data) => {
@@ -141,106 +192,157 @@ export default function DiscussionPage({ discussionId }) {
     }
   }, [discussionId])
 
+  const handleUserInput = useCallback(async () => {
+    const text = userInput.trim()
+    if (!text || sendingInput) return
+    const wasWaiting = status === 'waiting_input'
+    setSendingInput(true)
+    // Optimistic update — show user message immediately
+    setMessages(prev => [...prev, {
+      agent_name: '用户',
+      agent_role: 'user',
+      content: text,
+      phase: 'user_input',
+    }])
+    setUserInput('')
+    try {
+      await submitUserInput(discussionId, text)
+      // If we were waiting for input, auto-trigger a new discussion cycle
+      if (wasWaiting) {
+        setSendingInput(false)
+        startDiscussion()
+        return
+      }
+    } catch (e) {
+      setError(`发送失败: ${e.message}`)
+    } finally {
+      setSendingInput(false)
+    }
+  }, [discussionId, userInput, sendingInput, status])
+
   if (status === 'loading') return <div className="loading">加载中...</div>
   if (status === 'error' && !discussion) return <div className="error-msg">{error}</div>
 
   const topic = discussion?.topic || ''
-  const isLongTopic = topic.length > 20
+  const title = discussion?.title || ''
 
   return (
     <div className="discussion-page">
       <div className="discussion-header">
-        <h1 className={isLongTopic ? 'topic-long' : ''}>{topic}</h1>
+        <h1>{title || topic}</h1>
         <div className="discussion-controls">
           {phase && status === 'running' && (
-            <span className="phase-indicator">
-              <span className="phase-dot pulse" />
-              {PHASE_LABELS[phase] || phase}
+            <>
+              <span className="phase-indicator">
+                <span className="phase-dot pulse" />
+                {PHASE_LABELS[phase] || phase}
+              </span>
+              <button className="btn btn-sm" onClick={handleReplan}>
+                重新规划
+              </button>
+            </>
+          )}
+          {status === 'waiting_input' && (
+            <span className="phase-indicator waiting">
+              <span className="phase-dot" />
+              等待输入
             </span>
           )}
-          {status === 'ready' && (
-            <button className="btn btn-primary" onClick={startDiscussion} disabled={preparingAgents}>
-              {preparingAgents ? '准备中...' : '开始讨论'}
-            </button>
-          )}
-          {status === 'error' && (
+          {(status === 'ready' || status === 'error') && (
             <button className="btn btn-primary" onClick={() => {
               setMessages([])
               setError(null)
               startDiscussion()
-            }}>
-              重试
-            </button>
-          )}
-          {status === 'running' && (
-            <button className="btn btn-secondary" onClick={() => {
-              streamRef.current?.abort()
-              setStatus('ready')
-              setPhase('')
-              setLlmProgress(null)
-            }}>
-              停止
+            }} disabled={preparingAgents}>
+              {preparingAgents ? '准备中...' : status === 'error' ? '重试' : '开始讨论'}
             </button>
           )}
         </div>
       </div>
 
-      {error && <div className="error-msg">{error}</div>}
+      <div className="discussion-scroll-area">
+        {/* Original topic — scrollable, shown when title differs */}
+        {title && title !== topic && topic && (
+          <div className="discussion-topic-full">{topic}</div>
+        )}
 
-      {/* LLM streaming progress */}
-      {status === 'running' && llmProgress && (
-        <LLMProgressBar progress={llmProgress} />
-      )}
+        {error && <div className="error-msg">{error}</div>}
 
-      {/* Agent editing panel — only when ready (pre-run) */}
-      {status === 'ready' && (
-        <div className="agent-edit-panel">
-          <div className="agent-edit-header">专家团队配置</div>
-          {preparingAgents ? (
-            <div className="loading" style={{ padding: '24px' }}>正在生成专家团队...</div>
-          ) : (
-            <div className="agent-edit-list">
-              {agents.map(agent => (
-                <AgentEditCard
-                  key={agent.id}
-                  agent={agent}
-                  providers={providers}
-                  onSave={handleAgentSave}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Agent tags — when running or completed */}
-      {status !== 'ready' && agents.length > 0 && (
-        <div className="discussion-meta">
-          {agents.map(a => (
-            <span key={a.id} className={`agent-tag agent-tag-${a.role}`}>
-              {a.name}
-              <span className="agent-model">{a.provider}/{a.model}</span>
-            </span>
-          ))}
-        </div>
-      )}
-
-      <div className="messages-container">
-        {messages.map((msg, idx) => (
-          <MessageBubble key={idx} msg={msg} />
-        ))}
-        <div ref={messagesEndRef} />
-      </div>
-
-      {status === 'completed' && discussion?.final_summary && (
-        <div className="final-summary">
-          <h2>最终总结</h2>
-          <div className="summary-content">
-            {discussion.final_summary}
-            <CopyButton text={discussion.final_summary} />
+        {/* Agent editing panel — when ready or failed (allow fixing before retry) */}
+        {(status === 'ready' || status === 'error') && (
+          <div className="agent-edit-panel">
+            <div className="agent-edit-header">专家团队配置</div>
+            {preparingAgents ? (
+              <div className="loading" style={{ padding: '24px' }}>正在生成专家团队...</div>
+            ) : (
+              <div className="agent-edit-list">
+                {agents.map(agent => (
+                  <AgentEditCard
+                    key={agent.id}
+                    agent={agent}
+                    providers={providers}
+                    onSave={handleAgentSave}
+                  />
+                ))}
+              </div>
+            )}
           </div>
+        )}
+
+        {/* Agent tags — when running or completed */}
+        {status !== 'ready' && status !== 'error' && agents.length > 0 && (
+          <div className="discussion-meta">
+            {agents.map(a => (
+              <span key={a.id} className={`agent-tag agent-tag-${a.role}`}>
+                {a.name}
+                <span className="agent-model">{a.provider}/{a.model}</span>
+              </span>
+            ))}
+          </div>
+        )}
+
+        <div className="messages-container">
+          {messages.map((msg, idx) => (
+            <MessageBubble key={idx} msg={msg} />
+          ))}
+          <div ref={messagesEndRef} />
         </div>
-      )}
+      </div>
+
+      {/* Fixed input bar — always visible */}
+      <div className="user-input-fixed">
+          <div className="user-input-bar">
+            <textarea
+              className="form-input user-input-textarea"
+              value={userInput}
+              onChange={e => setUserInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault()
+                  handleUserInput()
+                }
+              }}
+              placeholder={
+                status === 'waiting_input' ? '输入你的想法，发送后将开始新一轮讨论... (Ctrl+Enter 发送)'
+                : status === 'running' ? '输入你的想法参与讨论... (Ctrl+Enter 发送)'
+                : '开始讨论后可输入...'
+              }
+              rows={2}
+              disabled={sendingInput || !['running', 'waiting_input'].includes(status)}
+            />
+            <button
+              className="btn btn-primary btn-send"
+              onClick={handleUserInput}
+              disabled={!userInput.trim() || sendingInput || !['running', 'waiting_input'].includes(status)}
+            >
+              {sendingInput ? '发送中...' : status === 'waiting_input' ? '发送并继续' : '发送'}
+            </button>
+          </div>
+          {/* LLM progress — inline below input bar */}
+          {llmProgress && (
+            <LLMProgressBar progress={llmProgress} />
+          )}
+        </div>
     </div>
   )
 }
@@ -258,8 +360,10 @@ function LLMProgressBar({ progress }) {
         <div key={name} className={`llm-progress-item ${status === 'done' ? 'done' : ''}`}>
           <span className="llm-progress-dot" />
           <span className="llm-progress-name">{name}</span>
-          <span className="llm-progress-label">正在思考...</span>
-          <span className="llm-progress-chars">{formatChars(chars)} chars</span>
+          <span className="llm-progress-label">
+            {status === 'waiting' ? '等待响应...' : '正在思考...'}
+          </span>
+          {chars > 0 && <span className="llm-progress-chars">{formatChars(chars)} chars</span>}
         </div>
       ))}
     </div>
@@ -270,26 +374,24 @@ function LLMProgressBar({ progress }) {
 function AgentEditCard({ agent, providers, onSave }) {
   const [name, setName] = useState(agent.name)
   const [persona, setPersona] = useState(agent.persona || '')
-  const [provider, setProvider] = useState(agent.provider)
   const [model, setModel] = useState(agent.model)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  // Build provider→models map from global providers
-  const providerModels = {}
-  for (const p of providers) {
-    const key = p.provider
-    if (!providerModels[key]) providerModels[key] = []
-    for (const m of (p.models || [])) {
-      providerModels[key].push(m.model)
-    }
-  }
+  // Find the initial provider by matching agent's provider type + model
+  const initProv = providers.find(p =>
+    p.provider === agent.provider && (p.models || []).some(m => m.model === agent.model)
+  ) || providers.find(p => p.provider === agent.provider) || providers[0]
+  const [selectedProvId, setSelectedProvId] = useState(initProv?.id || null)
 
-  const availableModels = providerModels[provider] || []
+  const selectedProv = providers.find(p => p.id === selectedProvId)
+  const availableModels = (selectedProv?.models || []).map(m => m.model)
 
-  const handleProviderChange = (newProvider) => {
-    setProvider(newProvider)
-    const models = providerModels[newProvider] || []
+  const handleProviderChange = (provId) => {
+    const prov = providers.find(p => p.id === Number(provId))
+    if (!prov) return
+    setSelectedProvId(prov.id)
+    const models = (prov.models || []).map(m => m.model)
     if (models.length > 0 && !models.includes(model)) {
       setModel(models[0])
     }
@@ -298,16 +400,8 @@ function AgentEditCard({ agent, providers, onSave }) {
 
   const handleSave = async () => {
     setSaving(true)
-    // Find api_key and base_url from global providers
-    const prov = providers.find(p => p.provider === provider)
-    await onSave(agent.id, {
-      name,
-      persona,
-      provider,
-      model,
-      api_key: prov?.api_key || null,
-      base_url: prov?.base_url || null,
-    })
+    // Send provider type (for AgentConfig.provider field)
+    await onSave(agent.id, { name, persona, provider: selectedProv?.provider || agent.provider, model, provider_id: selectedProvId })
     setDirty(false)
     setSaving(false)
   }
@@ -348,22 +442,22 @@ function AgentEditCard({ agent, providers, onSave }) {
         </div>
         <div className="form-row">
           <div className="form-group">
-            <label>Provider</label>
+            <label>供应商</label>
             <select
               className="form-select"
-              value={provider}
+              value={selectedProvId || ''}
               onChange={e => handleProviderChange(e.target.value)}
             >
-              {Object.keys(providerModels).map(p => (
-                <option key={p} value={p}>{p}</option>
+              {providers.map(p => (
+                <option key={p.id} value={p.id}>{p.name}</option>
               ))}
-              {!providerModels[provider] && (
-                <option value={provider}>{provider}</option>
+              {!selectedProv && (
+                <option value="">{agent.provider}</option>
               )}
             </select>
           </div>
           <div className="form-group">
-            <label>Model</label>
+            <label>模型</label>
             <select
               className="form-select"
               value={model}
@@ -419,18 +513,20 @@ function MessageBubble({ msg }) {
   const role = msg.agent_role || 'panelist'
   const [expanded, setExpanded] = useState(true)
 
+  const roleIcon = { host: '🎯', critic: '🔍', panelist: '💡', user: '👤' }
+
   return (
     <div className={`message-bubble role-${role}`}>
       <div className="message-header" onClick={() => setExpanded(v => !v)}>
         <span className="message-agent">
           <span className={`role-icon role-icon-${role}`}>
-            {role === 'host' ? '🎯' : role === 'critic' ? '🔍' : '💡'}
+            {roleIcon[role] || '💡'}
           </span>
           {msg.agent_name}
         </span>
         <span className="message-meta">
           {PHASE_LABELS[msg.phase] || msg.phase}
-          {msg.round_number !== undefined && ` · 第${msg.round_number + 1}轮`}
+          {msg.round_number !== undefined && role !== 'user' && ` · 第${msg.round_number + 1}轮`}
         </span>
       </div>
       {expanded && (

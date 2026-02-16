@@ -12,6 +12,7 @@ class DiscussionStatus(str, enum.Enum):
     DISCUSSING = "discussing"
     REFLECTING = "reflecting"
     SYNTHESIZING = "synthesizing"
+    WAITING_INPUT = "waiting_input"
     COMPLETED = "completed"
     FAILED = "failed"
 
@@ -28,6 +29,7 @@ class AgentRole(str, enum.Enum):
     HOST = "host"
     PANELIST = "panelist"
     CRITIC = "critic"
+    USER = "user"
 
 
 class Discussion(Base):

@@ -27,6 +27,7 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null)
   const [discussions, setDiscussions] = useState([])
   const [loading, setLoading] = useState(true)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   const refreshList = useCallback(() => {
     listDiscussions()
@@ -77,70 +78,83 @@ export default function App() {
   return (
     <div className="app-layout">
       {/* Sidebar */}
-      <aside className="sidebar">
+      <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-header">
-          <span className="sidebar-brand">圆桌讨论</span>
-        </div>
-
-        <button className="btn btn-primary sidebar-new-btn" onClick={handleNewDiscussion}>
-          + 新讨论
-        </button>
-
-        <div className="sidebar-list">
-          {loading ? (
-            <div className="sidebar-empty">加载中...</div>
-          ) : discussions.length === 0 ? (
-            <div className="sidebar-empty">暂无讨论</div>
-          ) : (
-            discussions.map(d => (
-              <div
-                key={d.id}
-                className={`sidebar-item ${selectedId === d.id && currentView === 'discussion' ? 'active' : ''}`}
-                onClick={() => handleSelectDiscussion(d.id)}
-              >
-                <div className="sidebar-item-top">
-                  <span className="sidebar-item-title">{d.title || d.topic}</span>
-                  <button
-                    className="sidebar-item-delete"
-                    onClick={(e) => handleDelete(e, d.id)}
-                    title="删除"
-                  >×</button>
-                </div>
-                <div className="sidebar-item-meta">
-                  <span
-                    className="sidebar-badge"
-                    style={{ backgroundColor: STATUS_COLORS[d.status] || '#6b7280' }}
-                  />
-                  <span>{MODE_LABELS[d.mode] || d.mode}</span>
-                  <span>·</span>
-                  <span>{new Date(d.created_at).toLocaleDateString('zh-CN')}</span>
-                </div>
-              </div>
-            ))
-          )}
-        </div>
-
-        <div className="sidebar-footer">
+          {!sidebarCollapsed && <span className="sidebar-brand">圆桌讨论</span>}
           <button
-            className={`sidebar-settings-btn ${currentView === 'settings' ? 'active' : ''}`}
-            onClick={() => setCurrentView('settings')}
+            className="btn-icon sidebar-toggle"
+            onClick={() => setSidebarCollapsed(v => !v)}
+            title={sidebarCollapsed ? '展开侧边栏' : '收起侧边栏'}
           >
-            ⚙ 设置
+            {sidebarCollapsed ? '▶' : '◀'}
           </button>
         </div>
+
+        {!sidebarCollapsed && (
+          <>
+            <button className="btn btn-primary sidebar-new-btn" onClick={handleNewDiscussion}>
+              + 新讨论
+            </button>
+
+            <div className="sidebar-list">
+              {loading ? (
+                <div className="sidebar-empty">加载中...</div>
+              ) : discussions.length === 0 ? (
+                <div className="sidebar-empty">暂无讨论</div>
+              ) : (
+                discussions.map(d => (
+                  <div
+                    key={d.id}
+                    className={`sidebar-item ${selectedId === d.id && currentView === 'discussion' ? 'active' : ''}`}
+                    onClick={() => handleSelectDiscussion(d.id)}
+                  >
+                    <div className="sidebar-item-top">
+                      <span className="sidebar-item-title">{d.title || d.topic}</span>
+                      <button
+                        className="sidebar-item-delete"
+                        onClick={(e) => handleDelete(e, d.id)}
+                        title="删除"
+                      >×</button>
+                    </div>
+                    <div className="sidebar-item-meta">
+                      <span
+                        className="sidebar-badge"
+                        style={{ backgroundColor: STATUS_COLORS[d.status] || '#6b7280' }}
+                      />
+                      <span>{MODE_LABELS[d.mode] || d.mode}</span>
+                      <span>·</span>
+                      <span>{new Date(d.created_at).toLocaleDateString('zh-CN')}</span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="sidebar-footer">
+              <button
+                className={`sidebar-settings-btn ${currentView === 'settings' ? 'active' : ''}`}
+                onClick={() => setCurrentView('settings')}
+              >
+                ⚙ 设置
+              </button>
+            </div>
+          </>
+        )}
       </aside>
 
-      {/* Main content */}
+      {/* Main content — use display:none to keep DiscussionPage mounted */}
       <main className="main-panel">
-        {currentView === 'create' && (
+        <div style={{ display: currentView === 'create' ? undefined : 'none', height: '100%' }}>
           <CreatePage onCreated={handleCreated} />
+        </div>
+        {selectedId && (
+          <div style={{ display: currentView === 'discussion' ? undefined : 'none', height: '100%' }}>
+            <DiscussionPage discussionId={selectedId} key={selectedId} />
+          </div>
         )}
-        {currentView === 'discussion' && selectedId && (
-          <DiscussionPage discussionId={selectedId} key={selectedId} />
-        )}
-        {currentView === 'settings' && (
+        <div style={{ display: currentView === 'settings' ? undefined : 'none', height: '100%' }}>
           <SettingsPage />
-        )}
+        </div>
       </main>
     </div>
   )

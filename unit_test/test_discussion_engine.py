@@ -40,6 +40,7 @@ def _make_state(**overrides) -> dict:
         "final_summary": "",
         "phase": "planning",
         "error": None,
+        "discussion_id": 0,
     }
     defaults.update(overrides)
     return defaults
@@ -114,18 +115,30 @@ class TestShouldContinueOrSynthesize:
         state = _make_state(current_round=2, max_rounds=3)
         assert should_continue_or_synthesize(state) == "synthesize"
 
-    def test_synthesize_on_verdict(self):
-        state = _make_state(critic_feedback="Good discussion. VERDICT: SYNTHESIZE")
+    def test_continue_when_rounds_remain(self):
+        state = _make_state(current_round=0, max_rounds=3, critic_feedback="Some feedback")
+        assert should_continue_or_synthesize(state) == "continue"
+
+    def test_continue_when_no_feedback(self):
+        state = _make_state(current_round=0, max_rounds=3, critic_feedback="")
+        assert should_continue_or_synthesize(state) == "continue"
+
+    def test_ignores_verdict_in_feedback(self):
+        """VERDICT is no longer checked — pure round counting."""
+        state = _make_state(current_round=0, max_rounds=3, critic_feedback="VERDICT: SYNTHESIZE")
+        assert should_continue_or_synthesize(state) == "continue"
+
+    def test_multi_round_continues_each_round(self):
+        """Verify all rounds before max_rounds-1 return continue."""
+        for r in range(5):
+            state = _make_state(current_round=r, max_rounds=6)
+            assert should_continue_or_synthesize(state) == "continue"
+
+    def test_multi_round_synthesizes_at_last(self):
+        """Verify synthesis triggers exactly at max_rounds-1."""
+        state = _make_state(current_round=5, max_rounds=6)
         assert should_continue_or_synthesize(state) == "synthesize"
 
-    def test_continue_when_rounds_remain(self):
-        state = _make_state(current_round=0, max_rounds=3, critic_feedback="VERDICT: CONTINUE")
-        assert should_continue_or_synthesize(state) == "continue"
-
-    def test_continue_when_no_verdict(self):
-        state = _make_state(current_round=0, max_rounds=3, critic_feedback="Some feedback without verdict")
-        assert should_continue_or_synthesize(state) == "continue"
-
-    def test_verdict_case_insensitive(self):
-        state = _make_state(critic_feedback="verdict: synthesize")
+    def test_single_round_synthesizes_immediately(self):
+        state = _make_state(current_round=0, max_rounds=1)
         assert should_continue_or_synthesize(state) == "synthesize"
