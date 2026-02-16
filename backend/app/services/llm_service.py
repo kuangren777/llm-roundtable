@@ -36,8 +36,7 @@ async def call_llm(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     temperature: float = 0.7,
-    max_tokens: int = 2000,
-    timeout: float = 120,
+    timeout: float = 180,
 ) -> str:
     """Call an LLM via the OpenAI-compatible chat completions API."""
     normalized_url = _normalize_base_url(base_url)
@@ -51,7 +50,6 @@ async def call_llm(
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
     )
 
     # Some OpenAI-compatible endpoints return raw strings (e.g. HTML error pages)
@@ -74,9 +72,8 @@ async def call_llm_stream(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     temperature: float = 0.7,
-    max_tokens: int = 2000,
     on_chunk=None,  # async callback(chunk_text: str, total_chars: int)
-    timeout: float = 120,
+    timeout: float = 180,
 ) -> tuple[str, int]:
     """Streaming LLM call with on_chunk progress callback. Returns (full_text, total_chars)."""
     normalized_url = _normalize_base_url(base_url)
@@ -90,7 +87,6 @@ async def call_llm_stream(
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
         stream=True,
     )
 

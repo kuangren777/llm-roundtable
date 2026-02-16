@@ -324,16 +324,15 @@ export default function DiscussionPage({ discussionId }) {
               }}
               placeholder={
                 status === 'waiting_input' ? '输入你的想法，发送后将开始新一轮讨论... (Ctrl+Enter 发送)'
-                : status === 'running' ? '输入你的想法参与讨论... (Ctrl+Enter 发送)'
-                : '开始讨论后可输入...'
+                : '输入你的想法指导讨论方向... (Ctrl+Enter 发送)'
               }
               rows={2}
-              disabled={sendingInput || !['running', 'waiting_input'].includes(status)}
+              disabled={sendingInput}
             />
             <button
               className="btn btn-primary btn-send"
               onClick={handleUserInput}
-              disabled={!userInput.trim() || sendingInput || !['running', 'waiting_input'].includes(status)}
+              disabled={!userInput.trim() || sendingInput}
             >
               {sendingInput ? '发送中...' : status === 'waiting_input' ? '发送并继续' : '发送'}
             </button>
@@ -485,7 +484,20 @@ function CopyButton({ text }) {
     e.stopPropagation()
     if (!text) return
     try {
-      await navigator.clipboard.writeText(text)
+      // navigator.clipboard requires secure context (HTTPS/localhost)
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        // Fallback for HTTP
+        const ta = document.createElement('textarea')
+        ta.value = text
+        ta.style.position = 'fixed'
+        ta.style.left = '-9999px'
+        document.body.appendChild(ta)
+        ta.select()
+        document.execCommand('copy')
+        document.body.removeChild(ta)
+      }
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {}

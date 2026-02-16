@@ -397,7 +397,6 @@ Format as a well-structured report."""
                 {"role": "user", "content": prompt},
             ],
             phase="synthesizing",
-            max_tokens=3000,
         )
         return {
             "final_summary": summary,
