@@ -192,6 +192,12 @@ export async function stopDiscussion(id) {
   return res.json()
 }
 
+export async function resetDiscussion(id) {
+  const res = await fetch(`${API_BASE}/discussions/${id}/reset`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to reset discussion: ${res.statusText}`)
+  return res.json()
+}
+
 export async function completeDiscussion(id) {
   const res = await fetch(`${API_BASE}/discussions/${id}/complete`, { method: 'POST' })
   if (!res.ok) throw new Error(`Failed to complete discussion: ${res.statusText}`)

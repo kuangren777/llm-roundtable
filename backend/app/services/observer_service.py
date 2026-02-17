@@ -95,8 +95,21 @@ async def chat_with_observer(
     context = _build_discussion_context(discussion, discussion.messages)
     observer_history = await get_observer_history(db, discussion_id)
 
-    llm_messages = [{"role": "system", "content": OBSERVER_SYSTEM_PROMPT}]
-    llm_messages.append({"role": "system", "content": f"以下是当前讨论的完整内容:\n\n{context}"})
+    logger.info(
+        "Observer context for discussion %d: %d messages, %d chars, provider=%s model=%s",
+        discussion_id, len(discussion.messages), len(context), req.provider, req.model,
+    )
+
+    # Put discussion context as a separate user message instead of stuffing it
+    # all into system prompt — some providers/models (especially GPT via proxies)
+    # truncate or ignore long system messages.
+    system_content = OBSERVER_SYSTEM_PROMPT
+    context_msg = f"--- 以下是当前讨论的完整内容，请基于这些内容回答我的问题 ---\n\n{context}"
+    llm_messages = [
+        {"role": "system", "content": system_content},
+        {"role": "user", "content": context_msg},
+        {"role": "assistant", "content": "好的，我已经仔细阅读了以上讨论的全部内容。请问你想了解什么？"},
+    ]
     # Add prior observer conversation (skip the just-added user message — it goes last)
     for om in observer_history:
         if om.id == user_msg.id:

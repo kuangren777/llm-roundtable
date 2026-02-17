@@ -29,6 +29,7 @@ from ..services.discussion_service import (
     summarize_discussion_messages,
     delete_user_message,
     update_user_message,
+    reset_discussion,
 )
 
 router = APIRouter(prefix="/api/discussions", tags=["discussions"])
@@ -115,6 +116,17 @@ async def stop_discussion_endpoint(discussion_id: int, db: AsyncSession = Depend
     if not ok:
         raise HTTPException(status_code=404, detail="Discussion not found")
     return {"status": "stopped"}
+
+
+@router.post("/{discussion_id}/reset")
+async def reset_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
+    """Delete all messages, reset status/round/summary, then restart."""
+    # Stop first if running
+    await stop_discussion(db, discussion_id)
+    discussion = await reset_discussion(db, discussion_id)
+    if not discussion:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    return {"status": "reset"}
 
 
 @router.post("/{discussion_id}/complete")

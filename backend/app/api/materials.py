@@ -1,8 +1,13 @@
 """API routes for the global material library."""
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
+from ..models.models import DiscussionMaterial
 from ..schemas.schemas import MaterialResponse, TextPasteRequest
 from ..services.discussion_service import (
     list_library_materials,
@@ -52,3 +57,21 @@ async def delete_library_endpoint(material_id: int, db: AsyncSession = Depends(g
     deleted = await delete_library_material(db, material_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Library material not found")
+
+
+@router.get("/{material_id}/download")
+async def download_material(material_id: int, db: AsyncSession = Depends(get_db)):
+    """Download/view a material file by ID (works for both library and discussion materials)."""
+    result = await db.execute(
+        select(DiscussionMaterial).where(DiscussionMaterial.id == material_id)
+    )
+    material = result.scalar_one_or_none()
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+    if not os.path.isfile(material.filepath):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    return FileResponse(
+        material.filepath,
+        filename=material.filename,
+        media_type=material.mime_type or "application/octet-stream",
+    )

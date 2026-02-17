@@ -6,12 +6,12 @@ import SettingsPage from './pages/SettingsPage'
 
 const STATUS_COLORS = {
   created: '#6b7280',
-  planning: '#3b82f6',
-  discussing: '#8b5cf6',
-  reflecting: '#f59e0b',
-  synthesizing: '#10b981',
-  completed: '#059669',
-  failed: '#ef4444',
+  planning: '#2563eb',
+  discussing: '#7c3aed',
+  reflecting: '#b45309',
+  synthesizing: '#047857',
+  completed: '#047857',
+  failed: '#dc2626',
 }
 
 const MODE_LABELS = {

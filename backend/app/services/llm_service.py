@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 7
 BASE_DELAY = 1.0  # seconds
 
+# GPT series models: default reasoning_effort=high
+_GPT_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
+
+
+def _is_gpt_model(model: str) -> bool:
+    """Detect OpenAI GPT series models."""
+    base = model.lower().split("/")[-1]
+    return any(base.startswith(p) for p in _GPT_MODEL_PREFIXES)
+
 
 def _normalize_base_url(url: Optional[str]) -> Optional[str]:
     """Ensure base_url ends with /v1 for OpenAI-compatible APIs when the path is empty.
@@ -55,6 +64,8 @@ async def call_llm(
     for attempt in range(MAX_RETRIES):
         try:
             create_kwargs = dict(model=model, messages=messages, temperature=temperature)
+            if _is_gpt_model(model):
+                create_kwargs["reasoning_effort"] = "high"
             if "max_tokens" in kwargs:
                 create_kwargs["max_tokens"] = kwargs["max_tokens"]
             response = await client.chat.completions.create(**create_kwargs)
@@ -107,12 +118,10 @@ async def call_llm_stream(
     last_error = None
     for attempt in range(MAX_RETRIES):
         try:
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                stream=True,
-            )
+            create_kwargs = dict(model=model, messages=messages, stream=True, temperature=temperature)
+            if _is_gpt_model(model):
+                create_kwargs["reasoning_effort"] = "high"
+            stream = await client.chat.completions.create(**create_kwargs)
 
             chunks = []
             total_chars = 0

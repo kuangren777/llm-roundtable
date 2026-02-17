@@ -195,6 +195,26 @@ async def delete_discussion(db: AsyncSession, discussion_id: int) -> bool:
     return True
 
 
+async def reset_discussion(db: AsyncSession, discussion_id: int) -> Discussion | None:
+    """Delete all messages, reset status/round/summary, keep agents and materials."""
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        return None
+    # Delete all messages
+    result = await db.execute(
+        select(Message).where(Message.discussion_id == discussion_id)
+    )
+    for msg in result.scalars().all():
+        await db.delete(msg)
+    # Reset discussion state
+    discussion.status = DiscussionStatus.CREATED
+    discussion.current_round = 0
+    discussion.final_summary = None
+    await db.commit()
+    await db.refresh(discussion)
+    return discussion
+
+
 async def update_agent(db: AsyncSession, discussion_id: int, agent_id: int, data: AgentConfigUpdate) -> AgentConfig | None:
     """Update an agent's config fields. Only allowed before discussion runs."""
     result = await db.execute(

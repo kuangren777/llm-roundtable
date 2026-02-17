@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { getDiscussion, streamDiscussion, stopDiscussion, prepareAgents, updateAgent, listLLMProviders, submitUserInput, streamSummarize, deleteMessage, updateMessage, getObserverHistory, clearObserverHistory, streamObserverChat } from '../services/api'
+import { getDiscussion, streamDiscussion, stopDiscussion, resetDiscussion, prepareAgents, updateAgent, listLLMProviders, submitUserInput, streamSummarize, deleteMessage, updateMessage, getObserverHistory, clearObserverHistory, streamObserverChat } from '../services/api'
 
 const PHASE_LABELS = {
   planning: '规划中',
@@ -38,6 +38,8 @@ export default function DiscussionPage({ discussionId }) {
   const [summaryProgress, setSummaryProgress] = useState(null)
   const [summarizingMsgId, setSummarizingMsgId] = useState(null)
   const [editingAgentId, setEditingAgentId] = useState(null)
+  const [materialsModalOpen, setMaterialsModalOpen] = useState(false)
+  const [textViewContent, setTextViewContent] = useState(null) // { filename, content }
   // Observer panel state
   const [observerOpen, setObserverOpen] = useState(false)
   const [observerMessages, setObserverMessages] = useState([])
@@ -47,6 +49,7 @@ export default function DiscussionPage({ discussionId }) {
   const [observerConfig, setObserverConfig] = useState({ providerId: null, provider: '', model: '' })
   const observerStreamRef = useRef(null)
   const observerEndRef = useRef(null)
+  const [observerWidth, setObserverWidth] = useState(360)
   const streamRef = useRef(null)
   const messagesEndRef = useRef(null)
   const scrollAreaRef = useRef(null)
@@ -216,10 +219,20 @@ export default function DiscussionPage({ discussionId }) {
     streamRef.current = controller
   }
 
-  const handleReplan = async () => {
+  const handleStop = async () => {
     streamRef.current?.abort()
     try { await stopDiscussion(discussionId) } catch {}
     setLlmProgress(null)
+    setStatus('completed')
+    setPhase('')
+  }
+
+  const handleReplan = async () => {
+    streamRef.current?.abort()
+    try { await resetDiscussion(discussionId) } catch {}
+    setMessages([])
+    setLlmProgress(null)
+    setPhase('')
     setError(null)
     startDiscussion()
   }
@@ -283,6 +296,28 @@ export default function DiscussionPage({ discussionId }) {
     }
   }, [discussionId, status])
 
+  // Handle clicking a material item — preview text, open image, or download
+  const handleMaterialClick = useCallback(async (m) => {
+    const url = `/api/materials/${m.id}/download`
+    if (m.mime_type?.startsWith('image/')) {
+      window.open(url, '_blank')
+    } else if (m.mime_type === 'text/markdown' || m.mime_type === 'text/plain' || m.filename?.endsWith('.md') || m.filename?.endsWith('.txt')) {
+      try {
+        const res = await fetch(url)
+        if (!res.ok) throw new Error('Failed to fetch')
+        const text = await res.text()
+        setTextViewContent({ filename: m.filename, content: text })
+      } catch {
+        window.open(url, '_blank')
+      }
+    } else {
+      const a = document.createElement('a')
+      a.href = url
+      a.download = m.filename
+      a.click()
+    }
+  }, [])
+
   // Count unsummarized long messages
   const unsummarizedCount = messages.filter(m => (m.content || '').length >= 200 && !m.summary).length
 
@@ -310,6 +345,61 @@ export default function DiscussionPage({ discussionId }) {
     )
   }, [discussionId])
 
+  const handleExport = useCallback(() => {
+    const d = discussion
+    if (!d) return
+    const lines = []
+    // Title & topic
+    lines.push(`# ${d.title || d.topic}`)
+    if (d.title && d.title !== d.topic) {
+      lines.push('', `> ${d.topic}`)
+    }
+    lines.push('', `- 模式: ${d.mode || '—'}`)
+    lines.push(`- 轮数: ${d.max_rounds ?? '—'}`)
+    lines.push(`- 状态: ${d.status || '—'}`)
+    // Agent table
+    if (agents.length > 0) {
+      lines.push('', '## 专家团队', '', '| 角色 | 名称 | 供应商/模型 |', '| --- | --- | --- |')
+      agents.forEach(a => {
+        const roleLabel = ROLE_LABELS[a.role] || a.role
+        lines.push(`| ${roleLabel} | ${a.name} | ${a.provider}/${a.model} |`)
+      })
+    }
+    // Materials
+    const mats = d.materials || []
+    if (mats.length > 0) {
+      lines.push('', '## 参考资料', '')
+      mats.forEach(m => lines.push(`- ${m.filename} (${m.content_type || '—'}, ${m.file_size ? (m.file_size / 1024).toFixed(1) + 'KB' : '—'})`))
+    }
+    // Messages grouped by round
+    if (messages.length > 0) {
+      lines.push('', '## 讨论记录', '')
+      let lastRound = -1
+      messages.forEach(msg => {
+        if (msg.round_number !== undefined && msg.round_number !== lastRound) {
+          lastRound = msg.round_number
+          lines.push(`### 第 ${msg.round_number + 1} 轮`, '')
+        }
+        const icon = { host: '🎯', critic: '🔍', panelist: '💡', user: '👤' }[msg.agent_role] || '💡'
+        const phase = PHASE_LABELS[msg.phase] || msg.phase || ''
+        const time = msg.created_at ? formatTime(msg.created_at) : ''
+        lines.push(`**${icon} ${msg.agent_name}** ${phase} ${time}`, '', msg.content || '', '')
+      })
+    }
+    // Final summary
+    if (d.final_summary) {
+      lines.push('## 最终总结', '', d.final_summary)
+    }
+    const md = lines.join('\n')
+    const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${(d.title || d.topic || 'discussion').replace(/[/\\?%*:|"<>]/g, '_')}.md`
+    a.click()
+    URL.revokeObjectURL(url)
+  }, [discussion, agents, messages])
+
   // Auto-trigger summarization when unsummarized messages exist
   const summarizeRef = useRef(false)
   useEffect(() => {
@@ -330,18 +420,21 @@ export default function DiscussionPage({ discussionId }) {
     <div className="discussion-page-wrapper">
     <div className={`discussion-page ${observerOpen ? 'with-observer' : ''}`}>
       <div className="discussion-header">
-        <h1>{title || topic}</h1>
+        <div className="discussion-title-row">
+          <h1>{title || topic}</h1>
+          <button
+            className={`btn btn-sm observer-toggle ${observerOpen ? 'active' : ''}`}
+            onClick={() => setObserverOpen(v => !v)}
+          >
+            👁 观察员
+          </button>
+        </div>
         <div className="discussion-controls">
           {phase && status === 'running' && (
-            <>
-              <span className="phase-indicator">
-                <span className="phase-dot pulse" />
-                {PHASE_LABELS[phase] || phase}
-              </span>
-              <button className="btn btn-sm" onClick={handleReplan}>
-                重新规划
-              </button>
-            </>
+            <span className="phase-indicator">
+              <span className="phase-dot pulse" />
+              {PHASE_LABELS[phase] || phase}
+            </span>
           )}
           {status === 'waiting_input' && (
             <span className="phase-indicator waiting">
@@ -366,12 +459,22 @@ export default function DiscussionPage({ discussionId }) {
               {preparingAgents ? '准备中...' : status === 'error' ? '重试' : '开始讨论'}
             </button>
           )}
-          <button
-            className={`btn btn-sm observer-toggle ${observerOpen ? 'active' : ''}`}
-            onClick={() => setObserverOpen(v => !v)}
-          >
-            👁 观察员
-          </button>
+          {status !== 'ready' && status !== 'error' && (
+            <>
+              <button className="phase-indicator phase-btn" onClick={handleReplan}>
+                ↻ 全部重新规划
+              </button>
+              <button className="phase-indicator phase-btn danger" onClick={handleStop}>
+                ■ 停止
+              </button>
+              <button className="phase-indicator phase-btn" onClick={() => setMaterialsModalOpen(true)}>
+                📎 资料
+              </button>
+              <button className="phase-indicator phase-btn" onClick={handleExport}>
+                📥 导出
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -403,6 +506,68 @@ export default function DiscussionPage({ discussionId }) {
                 setEditingAgentId(null)
               }}
             />
+          </div>
+        </div>
+      )}
+      {materialsModalOpen && (
+        <div className="modal-overlay" onClick={() => setMaterialsModalOpen(false)}>
+          <div className="modal-content" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>📎 讨论资料</h2>
+              <button className="btn btn-sm" onClick={() => setMaterialsModalOpen(false)}>✕</button>
+            </div>
+            <div className="modal-body">
+              {(discussion?.materials || []).length === 0 ? (
+                <div className="empty-state" style={{ padding: '32px 20px' }}>暂无资料</div>
+              ) : (
+                <div className="materials-list">
+                  {discussion.materials.map(m => (
+                    <div key={m.id} className="material-item material-item-clickable" onClick={() => handleMaterialClick(m)}>
+                      <div className="material-item-name">
+                        {m.mime_type?.startsWith('image/') ? '🖼️' : '📄'} {m.filename}
+                      </div>
+                      <div className="material-item-meta">
+                        {m.mime_type || '未知类型'}
+                        {m.file_size ? ` · ${(m.file_size / 1024).toFixed(1)} KB` : ''}
+                        {m.status && m.status !== 'ready' && ` · ${m.status}`}
+                      </div>
+                      {m.text_preview && (
+                        <div className="material-item-preview">{m.text_preview}</div>
+                      )}
+                      {m.meta_info && (
+                        <div className="material-item-metadata">
+                          {m.meta_info.summary && <div>{m.meta_info.summary}</div>}
+                          {m.meta_info.keywords?.length > 0 && (
+                            <div style={{ marginTop: 4 }}>
+                              {m.meta_info.keywords.map((kw, i) => (
+                                <span key={i} className="material-keyword-tag">{kw}</span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {textViewContent && (
+        <div className="modal-overlay" onClick={() => setTextViewContent(null)}>
+          <div className="modal-content text-view-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>📄 {textViewContent.filename}</h2>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <CopyButton text={textViewContent.content} />
+                <button className="btn btn-sm" onClick={() => setTextViewContent(null)}>✕</button>
+              </div>
+            </div>
+            <div className="modal-body">
+              <pre className="text-view-content">{textViewContent.content}</pre>
+            </div>
           </div>
         </div>
       )}
@@ -458,7 +623,11 @@ export default function DiscussionPage({ discussionId }) {
             <textarea
               className="form-input user-input-textarea"
               value={userInput}
-              onChange={e => setUserInput(e.target.value)}
+              onChange={e => {
+                setUserInput(e.target.value)
+                e.target.style.height = 'auto'
+                e.target.style.height = e.target.scrollHeight + 'px'
+              }}
               onKeyDown={e => {
                 if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                   e.preventDefault()
@@ -471,6 +640,13 @@ export default function DiscussionPage({ discussionId }) {
               }
               rows={2}
               disabled={sendingInput}
+            />
+            <ExpandInput
+              value={userInput}
+              onChange={setUserInput}
+              onSubmit={handleUserInput}
+              placeholder="输入你的想法指导讨论方向..."
+              submitLabel={status === 'waiting_input' ? '发送并继续' : '发送'}
             />
             <button
               className="btn btn-primary btn-send"
@@ -487,6 +663,8 @@ export default function DiscussionPage({ discussionId }) {
         </div>
     </div>
     {observerOpen && (
+      <>
+      <ObserverResizeHandle onResize={setObserverWidth} width={observerWidth} />
       <ObserverPanel
         discussionId={discussionId}
         providers={providers}
@@ -502,7 +680,9 @@ export default function DiscussionPage({ discussionId }) {
         setStreamText={setObserverStreamText}
         streamRef={observerStreamRef}
         endRef={observerEndRef}
+        width={observerWidth}
       />
+      </>
     )}
     </div>
   )
@@ -547,7 +727,82 @@ function StreamingStatus({ agents, phase, llmProgress, messages, currentRound, p
 }
 
 
-function ObserverPanel({ discussionId, providers, config, onConfigChange, messages, setMessages, input, setInput, streaming, setStreaming, streamText, setStreamText, streamRef, endRef }) {
+function ExpandInput({ value, onChange, onSubmit, placeholder, submitLabel }) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  const handleOpen = () => { setDraft(value); setOpen(true) }
+  const handleConfirm = () => { onChange(draft); setOpen(false) }
+  const handleSubmit = () => { onChange(draft); setOpen(false); onSubmit?.() }
+
+  if (!open) {
+    return (
+      <button className="btn-expand" onClick={handleOpen} title="展开输入框">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" />
+          <line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" />
+        </svg>
+      </button>
+    )
+  }
+
+  return (
+    <div className="modal-overlay" onClick={() => setOpen(false)}>
+      <div className="expand-modal" onClick={e => e.stopPropagation()}>
+        <div className="expand-modal-header">
+          <span>{placeholder || '输入内容'}</span>
+          <button className="btn btn-sm" onClick={() => setOpen(false)}>✕</button>
+        </div>
+        <textarea
+          className="form-input expand-textarea"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSubmit() } }}
+          placeholder={placeholder}
+          autoFocus
+        />
+        <div className="expand-modal-footer">
+          <span className="expand-hint">Ctrl+Enter 发送</span>
+          <div className="expand-modal-actions">
+            <button className="btn btn-sm" onClick={handleConfirm}>保留文字</button>
+            <button className="btn btn-primary btn-sm" onClick={handleSubmit}>{submitLabel || '发送'}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+function ObserverResizeHandle({ onResize, width }) {
+  const startX = useRef(0)
+  const startW = useRef(0)
+
+  const onMouseDown = (e) => {
+    e.preventDefault()
+    startX.current = e.clientX
+    startW.current = width
+    const onMouseMove = (ev) => {
+      const delta = startX.current - ev.clientX
+      onResize(Math.min(700, Math.max(240, startW.current + delta)))
+    }
+    const onMouseUp = () => {
+      document.removeEventListener('mousemove', onMouseMove)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    document.addEventListener('mousemove', onMouseMove)
+    document.addEventListener('mouseup', onMouseUp)
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }
+
+  return <div className="observer-resize-handle" onMouseDown={onMouseDown} />
+}
+
+
+function ObserverPanel({ discussionId, providers, config, onConfigChange, messages, setMessages, input, setInput, streaming, setStreaming, streamText, setStreamText, streamRef, endRef, width }) {
   const scrollToBottom = () => endRef.current?.scrollIntoView({ behavior: 'smooth' })
 
   useEffect(() => { scrollToBottom() }, [messages, streamText])
@@ -607,7 +862,7 @@ function ObserverPanel({ discussionId, providers, config, onConfigChange, messag
   }
 
   return (
-    <div className="observer-panel">
+    <div className="observer-panel" style={{ width, minWidth: width }}>
       <div className="observer-header">
         <span className="observer-title">👁 观察员</span>
         <button className="btn btn-sm" onClick={handleClear} title="清空对话">清空</button>
@@ -625,6 +880,7 @@ function ObserverPanel({ discussionId, providers, config, onConfigChange, messag
         {messages.map((msg, idx) => (
           <div key={msg.id || idx} className={`observer-msg observer-msg-${msg.role}`}>
             <div className="observer-msg-content">{msg.content}</div>
+            <CopyButton text={msg.content} />
           </div>
         ))}
         {streaming && streamText && (
@@ -643,11 +899,22 @@ function ObserverPanel({ discussionId, providers, config, onConfigChange, messag
         <textarea
           className="form-input"
           value={input}
-          onChange={e => setInput(e.target.value)}
+          onChange={e => {
+            setInput(e.target.value)
+            e.target.style.height = 'auto'
+            e.target.style.height = e.target.scrollHeight + 'px'
+          }}
           onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); handleSend() } }}
           placeholder="向观察员提问... (Ctrl+Enter)"
           rows={2}
           disabled={streaming}
+        />
+        <ExpandInput
+          value={input}
+          onChange={setInput}
+          onSubmit={handleSend}
+          placeholder="向观察员提问..."
+          submitLabel={streaming ? '回复中...' : '发送'}
         />
         <button className="btn btn-primary btn-send" onClick={handleSend} disabled={!input.trim() || streaming || !config.provider}>
           {streaming ? '回复中...' : '发送'}
