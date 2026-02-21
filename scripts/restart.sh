@@ -6,7 +6,7 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BACKEND_PORT=8000
-FRONTEND_PORT=3000
+FRONTEND_PORT=3214
 LOG_DIR="$PROJECT_ROOT/temp"
 mkdir -p "$LOG_DIR"
 

@@ -34,6 +34,8 @@ import {
   Square,
   X,
   Loader2,
+  FileText,
+  Download,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, MessageResponse, AgentConfigResponse, LLMProviderResponse, ObserverMessageResponse } from './types';
@@ -58,7 +60,9 @@ const RUNNING_STATUSES = ['planning', 'discussing', 'reflecting', 'synthesizing'
 function formatTime(ts: string) {
   const s = String(ts);
   const d = new Date(s.includes('Z') || s.includes('+') ? s : s + 'Z');
-  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  if (Date.now() - d.getTime() > 86400000) return d.toLocaleDateString(undefined, { month: '2-digit', day: '2-digit' }) + ' ' + time;
+  return time;
 }
 
 function statusLabel(s: string) {
@@ -71,7 +75,7 @@ function statusLabel(s: string) {
 
 const MarkdownRenderer = ({ content }: { content: string }) => {
   return (
-    <div className="prose dark:prose-invert prose-slate prose-sm prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg max-w-none leading-relaxed 
+    <div className="prose dark:prose-invert prose-slate prose-sm prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl max-w-none leading-relaxed 
         prose-headings:font-bold prose-headings:text-slate-800 dark:prose-headings:text-slate-100
         prose-a:text-violet-600 dark:prose-a:text-violet-400 prose-a:no-underline hover:prose-a:underline
         prose-strong:font-bold prose-strong:text-slate-900 dark:prose-strong:text-white
@@ -90,7 +94,7 @@ const MarkdownRenderer = ({ content }: { content: string }) => {
   );
 };
 
-const SummaryModal = ({ isOpen, onClose, content, title }: { isOpen: boolean; onClose: () => void; content: string; title: string }) => {
+const SummaryModal = ({ isOpen, onClose, content, title, onDownload }: { isOpen: boolean; onClose: () => void; content: string; title: string; onDownload?: () => void }) => {
   if (!isOpen) return null;
 
   return (
@@ -110,9 +114,16 @@ const SummaryModal = ({ isOpen, onClose, content, title }: { isOpen: boolean; on
             <BarChart3 className="w-5 h-5 text-violet-500" />
             {title}
           </h3>
-          <button onClick={onClose} className="p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors">
-            <X className="w-5 h-5 text-slate-500" />
-          </button>
+          <div className="flex items-center gap-1">
+            {onDownload && (
+              <button onClick={onDownload} className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors" title="Download">
+                <Download className="w-4 h-4 text-slate-500" />
+              </button>
+            )}
+            <button onClick={onClose} className="p-1 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors">
+              <X className="w-5 h-5 text-slate-500" />
+            </button>
+          </div>
         </div>
         <div className="p-6 overflow-y-auto custom-scrollbar">
            <MarkdownRenderer content={content} />
@@ -145,6 +156,7 @@ export default function App() {
   const [summaryModalOpen, setSummaryModalOpen] = useState(false);
   const [summaryContent, setSummaryContent] = useState('');
   const [summaryTitle, setSummaryTitle] = useState('');
+  const [summaryDownloadUrl, setSummaryDownloadUrl] = useState('');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newDebateOpen, setNewDebateOpen] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
@@ -161,6 +173,7 @@ export default function App() {
   const [observerStreamText, setObserverStreamText] = useState('');
   const [observerConfig, setObserverConfig] = useState<{ providerId: number | null; provider: string; model: string }>({ providerId: null, provider: '', model: '' });
   const observerStreamRef = useRef<AbortController | null>(null);
+  const observerTextRef = useRef('');
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const observerScrollRef = useRef<HTMLDivElement>(null);
@@ -368,8 +381,8 @@ export default function App() {
 
   const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
 
-  const openSummary = (content: string, title = 'Summary Details') => {
-    setSummaryContent(content); setSummaryTitle(title); setSummaryModalOpen(true);
+  const openSummary = (content: string, title = 'Summary Details', downloadUrl = '') => {
+    setSummaryContent(content); setSummaryTitle(title); setSummaryDownloadUrl(downloadUrl); setSummaryModalOpen(true);
   };
 
   // Observer chat
@@ -381,16 +394,16 @@ export default function App() {
     setObserverInput('');
     setObserverStreaming(true);
     setObserverStreamText('');
+    observerTextRef.current = '';
     const ctrl = streamObserverChat(
       activeId,
       { content: text, provider: observerConfig.provider, model: observerConfig.model, provider_id: observerConfig.providerId ?? undefined },
-      (chunk) => setObserverStreamText(prev => prev + chunk),
+      (chunk) => { observerTextRef.current += chunk; setObserverStreamText(prev => prev + chunk); },
       (err) => { setObserverStreamText(prev => prev + `\n[Error: ${err}]`); setObserverStreaming(false); },
       () => {
-        setObserverStreamText(prev => {
-          if (prev) setObserverMessages(msgs => [...msgs, { id: Date.now() + 1, role: 'observer', content: prev, created_at: new Date().toISOString() }]);
-          return '';
-        });
+        const text = observerTextRef.current;
+        if (text) setObserverMessages(msgs => [...msgs, { id: Date.now() + 1, role: 'observer', content: text, created_at: new Date().toISOString() }]);
+        setObserverStreamText('');
         setObserverStreaming(false);
       },
     );
@@ -411,7 +424,8 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-full overflow-hidden font-sans">
-      <SummaryModal isOpen={summaryModalOpen} onClose={() => setSummaryModalOpen(false)} content={summaryContent} title={summaryTitle} />
+      <SummaryModal isOpen={summaryModalOpen} onClose={() => { setSummaryModalOpen(false); setSummaryDownloadUrl(''); }} content={summaryContent} title={summaryTitle}
+        onDownload={summaryDownloadUrl ? () => window.open(summaryDownloadUrl, '_blank') : undefined} />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onProvidersChange={() => listLLMProviders().then(setProviders).catch(() => {})} />
       <NewDebateModal isOpen={newDebateOpen} onClose={() => setNewDebateOpen(false)} onCreated={(d) => { refreshList(); setActiveId(d.id); }} />
 
@@ -542,7 +556,7 @@ export default function App() {
                   <MoreVertical className="w-5 h-5" />
                 </button>
                 {showHeaderMenu && (
-                  <div className="absolute right-0 mt-2 w-48 bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-slate-200 dark:border-slate-700 py-1 z-50">
+                  <div className="absolute right-0 mt-2 w-64 bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-slate-200 dark:border-slate-700 py-1 z-50 max-h-96 overflow-y-auto">
                     <button onClick={() => { setShowHeaderMenu(false); handleStop(); }}
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
                       <Square className="w-3.5 h-3.5" /> Stop Discussion
@@ -556,6 +570,26 @@ export default function App() {
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">
                       Generate Title
                     </button>
+                    {detail?.materials && detail.materials.length > 0 && (
+                      <>
+                        <div className="h-px bg-slate-200 dark:bg-slate-700 my-1" />
+                        <div className="px-4 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-widest">Materials</div>
+                        {detail.materials.map(m => (
+                          <button key={m.id}
+                            onClick={() => {
+                              setShowHeaderMenu(false);
+                              fetch(`/api/materials/${m.id}/content`).then(r => r.json()).then(d => {
+                                openSummary(d.content, m.filename, `/api/materials/${m.id}/download`);
+                              }).catch(() => window.open(`/api/materials/${m.id}/download`, '_blank'));
+                            }}
+                            className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2 truncate">
+                            <FileText className="w-3.5 h-3.5 shrink-0 text-violet-500" />
+                            <span className="truncate">{m.filename}</span>
+                            <span className="text-[10px] text-slate-400 shrink-0">{m.file_type}</span>
+                          </button>
+                        ))}
+                      </>
+                    )}
                   </div>
                 )}
               </div>

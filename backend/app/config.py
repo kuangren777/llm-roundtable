@@ -3,7 +3,7 @@ from functools import lru_cache
 import os
 
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_PROJECT_ROOT = os.environ.get("PROJECT_ROOT", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 _DB_PATH = os.path.join(_PROJECT_ROOT, "debate.db")
 
 

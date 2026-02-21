@@ -59,6 +59,22 @@ async def delete_library_endpoint(material_id: int, db: AsyncSession = Depends(g
         raise HTTPException(status_code=404, detail="Library material not found")
 
 
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _resolve_filepath(stored_path: str) -> str | None:
+    """Resolve stored filepath, handling machine migration."""
+    if os.path.isfile(stored_path):
+        return stored_path
+    # Try extracting relative path from 'backend/uploads/...'
+    idx = stored_path.find("backend/uploads/")
+    if idx >= 0:
+        candidate = os.path.join(_PROJECT_ROOT, stored_path[idx:])
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 @router.get("/{material_id}/download")
 async def download_material(material_id: int, db: AsyncSession = Depends(get_db)):
     """Download/view a material file by ID (works for both library and discussion materials)."""
@@ -68,10 +84,33 @@ async def download_material(material_id: int, db: AsyncSession = Depends(get_db)
     material = result.scalar_one_or_none()
     if not material:
         raise HTTPException(status_code=404, detail="Material not found")
-    if not os.path.isfile(material.filepath):
+    resolved = _resolve_filepath(material.filepath)
+    if not resolved:
         raise HTTPException(status_code=404, detail="File not found on disk")
     return FileResponse(
-        material.filepath,
+        resolved,
         filename=material.filename,
         media_type=material.mime_type or "application/octet-stream",
     )
+
+
+@router.get("/{material_id}/content")
+async def material_content(material_id: int, db: AsyncSession = Depends(get_db)):
+    """Return material text content for in-page preview."""
+    result = await db.execute(
+        select(DiscussionMaterial).where(DiscussionMaterial.id == material_id)
+    )
+    material = result.scalar_one_or_none()
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found")
+    if material.text_content:
+        return {"content": material.text_content, "filename": material.filename, "mime_type": material.mime_type}
+    # For non-text files, try reading from disk
+    resolved = _resolve_filepath(material.filepath)
+    if not resolved:
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            return {"content": f.read(), "filename": material.filename, "mime_type": material.mime_type}
+    except (UnicodeDecodeError, OSError):
+        raise HTTPException(status_code=400, detail="Binary file cannot be previewed")
