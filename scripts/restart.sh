@@ -33,7 +33,7 @@ start_backend() {
 
     echo -e "${CYAN}[Backend]${NC} 启动 uvicorn :${BACKEND_PORT} ..."
     cd "$PROJECT_ROOT"
-    nohup uvicorn backend.app.main:app \
+    nohup /home/bigdata/miniconda3/envs/agent/bin/python -m uvicorn backend.app.main:app \
         --host 0.0.0.0 --port $BACKEND_PORT --reload \
         > "$LOG_DIR/backend.log" 2>&1 &
     local pid=$!
@@ -52,7 +52,7 @@ start_frontend() {
     kill_by_port $FRONTEND_PORT
 
     echo -e "${CYAN}[Frontend]${NC} 启动 vite dev :${FRONTEND_PORT} ..."
-    cd "$PROJECT_ROOT/frontend"
+    cd "$PROJECT_ROOT/frontend-new"
     nohup npx vite --host 0.0.0.0 --port $FRONTEND_PORT \
         > "$LOG_DIR/frontend.log" 2>&1 &
     local pid=$!
