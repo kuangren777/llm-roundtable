@@ -61,6 +61,13 @@ const PHASE_LABELS: Record<string, string> = {
   next_step_planning: '下一步规划中',
 };
 
+const ROLE_LABELS: Record<string, string> = {
+  host: '主持人',
+  panelist: '专家',
+  critic: '批评家',
+  user: '用户',
+};
+
 const RUNNING_STATUSES = ['planning', 'discussing', 'reflecting', 'synthesizing'];
 
 function roleOwnsPhase(role: string, phase: string) {
@@ -87,6 +94,24 @@ function statusLabel(s: string) {
   if (s === 'completed') return 'Completed';
   if (s === 'failed') return 'Failed';
   return s;
+}
+
+function toDateTime(ts?: string | null) {
+  if (!ts) return '-';
+  const d = new Date(ts.includes('Z') || ts.includes('+') ? ts : `${ts}Z`);
+  if (Number.isNaN(d.getTime())) return '-';
+  return d.toLocaleString();
+}
+
+function toSafeFileName(name: string) {
+  return name
+    .replace(/[\/\\?%*:|"<>]/g, '_')
+    .replace(/\s+/g, '_')
+    .slice(0, 120) || 'discussion';
+}
+
+function toMarkdownCell(text: string) {
+  return String(text || '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
 function normalizeMarkdown(content: string) {
@@ -854,6 +879,109 @@ export default function App() {
     setSummaryContent(content); setSummaryTitle(title); setSummaryDownloadUrl(downloadUrl); setSummaryModalOpen(true);
   };
 
+  const handleDownloadConversation = useCallback(() => {
+    if (!detail) return;
+
+    const title = detail.title || detail.topic || `discussion-${detail.id}`;
+    const lines: string[] = [];
+    lines.push(`# ${title}`);
+
+    if (detail.title && detail.topic && detail.title !== detail.topic) {
+      lines.push('', `> 主题: ${detail.topic}`);
+    }
+
+    lines.push(
+      '',
+      `- ID: ${detail.id}`,
+      `- 模式: ${detail.mode || '-'}`,
+      `- 状态: ${detail.status || '-'}`,
+      `- 轮次: ${detail.current_round}/${detail.max_rounds}`,
+      `- 创建时间: ${toDateTime(detail.created_at)}`,
+      `- 更新时间: ${toDateTime(detail.updated_at)}`,
+    );
+
+    if (agents.length > 0) {
+      lines.push('', '## 参与者配置', '', '| 角色 | 名称 | 模型 |', '| --- | --- | --- |');
+      agents.forEach((agent) => {
+        lines.push(
+          `| ${toMarkdownCell(ROLE_LABELS[agent.role] || agent.role)} | ${toMarkdownCell(agent.name)} | ${toMarkdownCell(`${agent.provider}/${agent.model}`)} |`,
+        );
+      });
+    }
+
+    if (detail.materials && detail.materials.length > 0) {
+      lines.push('', '## 参考资料', '');
+      detail.materials.forEach((material) => {
+        const size = material.file_size ? `${(material.file_size / 1024).toFixed(1)} KB` : '-';
+        lines.push(`- ${material.filename} (${material.file_type || '-'}, ${size})`);
+      });
+    }
+
+    const exportMessages: MessageResponse[] = [...messages];
+    if (detail.topic && (!exportMessages.length || exportMessages[0]?.agent_role !== 'user')) {
+      exportMessages.unshift({
+        id: -detail.id,
+        agent_name: '用户',
+        agent_role: 'user',
+        content: detail.topic,
+        summary: null,
+        round_number: 0,
+        cycle_index: 0,
+        phase: 'user_input',
+        created_at: detail.created_at,
+      });
+    }
+
+    if (exportMessages.length > 0) {
+      lines.push('', '## 讨论记录', '');
+      let lastRound = -1;
+      exportMessages.forEach((msg) => {
+        if (msg.round_number !== lastRound) {
+          lastRound = msg.round_number;
+          lines.push(`### 第 ${msg.round_number + 1} 轮`, '');
+        }
+        const role = ROLE_LABELS[msg.agent_role] || msg.agent_role;
+        const phaseLabel = PHASE_LABELS[msg.phase || ''] || msg.phase || '-';
+        lines.push(`**${msg.agent_name}** (${role} | ${phaseLabel} | ${toDateTime(msg.created_at)})`, '');
+        lines.push(msg.content || '', '');
+      });
+    }
+
+    const runningStreams = Object.entries(streamingContent).filter(([, content]) => !!content);
+    if (runningStreams.length > 0) {
+      lines.push('', '## 进行中输出片段', '');
+      runningStreams.forEach(([agentName, content]) => {
+        lines.push(`### ${agentName}`, '', content, '');
+      });
+    }
+
+    if (detail.final_summary) {
+      lines.push('', '## 最终总结', '', detail.final_summary);
+    }
+
+    if (observerMessages.length > 0 || observerStreamText) {
+      lines.push('', '## Observer 记录', '');
+      observerMessages.forEach((msg) => {
+        lines.push(`**${msg.role}** (${toDateTime(msg.created_at)})`, '', msg.content || '', '');
+      });
+      if (observerStreamText) {
+        lines.push('**observer (streaming)**', '', observerStreamText, '');
+      }
+    }
+
+    const markdown = `${lines.join('\n').trim()}\n`;
+    const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const timestamp = new Date().toISOString().replace(/:/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = `${toSafeFileName(title)}_${timestamp}.md`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
+  }, [detail, agents, messages, streamingContent, observerMessages, observerStreamText]);
+
   const handleSummarize = useCallback(async () => {
     if (!activeId || summarizing) return;
     setSummarizing(true);
@@ -1193,6 +1321,10 @@ export default function App() {
                     <button onClick={() => { setShowHeaderMenu(false); handleReset(); }}
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
                       <RefreshCw className="w-3.5 h-3.5" /> Reset & Replan
+                    </button>
+                    <button onClick={() => { setShowHeaderMenu(false); handleDownloadConversation(); }}
+                      className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
+                      <Download className="w-3.5 h-3.5" /> Download Conversation
                     </button>
                     <div className="h-px bg-slate-200 dark:bg-slate-700 my-1" />
                     <button onClick={() => { setShowHeaderMenu(false); if (activeId) generateTitle(activeId).then(() => refreshList()); }}
