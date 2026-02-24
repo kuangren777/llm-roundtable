@@ -1123,7 +1123,9 @@ export default function App() {
     }
     return messages;
   }, [messages, detail]);
-  const unsummarizedCount = messages.filter(m => (m.content || '').length >= 200 && !m.summary).length;
+  const unsummarizedCount = messages.filter(
+    m => m.agent_role !== 'user' && (m.content || '').length >= 200 && !m.summary,
+  ).length;
 
   useEffect(() => {
     if (!activeId) return;
@@ -1495,22 +1497,8 @@ export default function App() {
                         </div>
                       </div>
                       <div className="relative">
-                        {msg.summary || (msg.id && streamingSummaries[msg.id]) ? (
-                          <>
-                            <MarkdownRenderer content={msg.summary || (msg.id ? streamingSummaries[msg.id] || '' : '')} />
-                            {!msg.summary && msg.id && streamingSummaries[msg.id] && (
-                              <div className="mt-2 text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                总结中{summarizingMsgId === msg.id ? ` · ${summaryProgress || ''}` : ''}
-                              </div>
-                            )}
-                            <button onClick={() => openSummary(msg.content, `Full message by ${msg.agent_name}`)}
-                              className="mt-2 text-violet-600 dark:text-violet-400 text-xs hover:underline flex items-center gap-1">
-                              <Maximize2 className="w-3 h-3" /> View full
-                            </button>
-                          </>
-                        ) : ['synthesizing', 'round_summary'].includes(msg.phase || '') || msg.agent_role === 'user' ? (
-                          msg.agent_role === 'user' && editingMsgIdx === idx ? (
+                        {msg.agent_role === 'user' ? (
+                          editingMsgIdx === idx ? (
                             <div className="flex flex-col gap-2">
                               <textarea value={editingContent} onChange={e => setEditingContent(e.target.value)}
                                 className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white resize-y min-h-[160px]"
@@ -1541,6 +1529,22 @@ export default function App() {
                               </div>
                             </div>
                           ) : <MarkdownRenderer content={msg.content} />
+                        ) : msg.summary || (msg.id && streamingSummaries[msg.id]) ? (
+                          <>
+                            <MarkdownRenderer content={msg.summary || (msg.id ? streamingSummaries[msg.id] || '' : '')} />
+                            {!msg.summary && msg.id && streamingSummaries[msg.id] && (
+                              <div className="mt-2 text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                总结中{summarizingMsgId === msg.id ? ` · ${summaryProgress || ''}` : ''}
+                              </div>
+                            )}
+                            <button onClick={() => openSummary(msg.content, `Full message by ${msg.agent_name}`)}
+                              className="mt-2 text-violet-600 dark:text-violet-400 text-xs hover:underline flex items-center gap-1">
+                              <Maximize2 className="w-3 h-3" /> View full
+                            </button>
+                          </>
+                        ) : ['synthesizing', 'round_summary'].includes(msg.phase || '') ? (
+                          <MarkdownRenderer content={msg.content} />
                         ) : summarizingMsgId === msg.id ? (
                           <div className="text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
                             <Loader2 className="w-3 h-3 animate-spin" />
