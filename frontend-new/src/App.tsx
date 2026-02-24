@@ -50,6 +50,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { NewDebateModal } from './components/NewDebateModal';
 import { AgentConfigModal } from './components/AgentConfigModal';
 import { ModelAvatar } from './components/ModelAvatar';
+import { copyTextWithFallback } from './utils/clipboard';
 import 'highlight.js/styles/github-dark.css';
 
 const PHASE_LABELS: Record<string, string> = {
@@ -343,23 +344,21 @@ const MarkdownRenderer = React.memo(
 );
 MarkdownRenderer.displayName = 'MarkdownRenderer';
 
-const SummaryModal = ({ isOpen, onClose, content, title, onDownload }: { isOpen: boolean; onClose: () => void; content: string; title: string; onDownload?: () => void }) => {
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (!copied) return;
-    const timer = window.setTimeout(() => setCopied(false), 1200);
-    return () => window.clearTimeout(timer);
-  }, [copied]);
-
-  const handleCopy = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(content || '');
-      setCopied(true);
-    } catch {
-      // Clipboard may be unavailable in some browsers/contexts.
+const SummaryModal = ({ isOpen, onClose, content, title, onDownload, onCopy }: {
+  isOpen: boolean;
+  onClose: () => void;
+  content: string;
+  title: string;
+  onDownload?: () => void;
+  onCopy?: (text: string) => void | Promise<void>;
+}) => {
+  const handleCopy = useCallback(() => {
+    if (onCopy) {
+      void onCopy(content || '');
+      return;
     }
-  }, [content]);
+    void copyTextWithFallback(content || '');
+  }, [content, onCopy]);
 
   if (!isOpen) return null;
 
@@ -383,15 +382,10 @@ const SummaryModal = ({ isOpen, onClose, content, title, onDownload }: { isOpen:
           <div className="flex items-center gap-1.5">
             <button
               onClick={handleCopy}
-              className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors relative"
+              className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors"
               title="Copy"
             >
               <Copy className="w-4 h-4 text-slate-500" />
-              {copied && (
-                <span className="absolute -bottom-6 right-0 text-[10px] text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
-                  已复制
-                </span>
-              )}
             </button>
             {onDownload && (
               <button onClick={onDownload} className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors" title="Download">
@@ -446,6 +440,7 @@ export default function App() {
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
   const [editingMsgIdx, setEditingMsgIdx] = useState<number | null>(null);
   const [editingContent, setEditingContent] = useState('');
+  const [toast, setToast] = useState<{ id: number; text: string; type: 'success' | 'error' } | null>(null);
 
   const [editingAgent, setEditingAgent] = useState<AgentConfigResponse | null>(null);
   const [rightSidebarWidth, setRightSidebarWidth] = useState(340);
@@ -472,6 +467,7 @@ export default function App() {
   const summarizeAutoRef = useRef(false);
   const summarizeAutoBlockUntilRef = useRef(0);
   const summarizeRunningCooldownRef = useRef(0);
+  const toastTimerRef = useRef<number | null>(null);
 
   const persistLiveState = useCallback((id: number, patch: Partial<LiveState>) => {
     const prev = liveStateRef.current[id] || {
@@ -873,7 +869,30 @@ export default function App() {
     if (activeId === id) setActiveId(null);
   }, [activeId]);
 
-  const copyToClipboard = (text: string) => navigator.clipboard.writeText(text);
+  const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
+    const id = Date.now();
+    setToast({ id, text, type });
+    if (toastTimerRef.current) {
+      window.clearTimeout(toastTimerRef.current);
+    }
+    toastTimerRef.current = window.setTimeout(() => {
+      setToast(prev => (prev?.id === id ? null : prev));
+      toastTimerRef.current = null;
+    }, 1500);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
+    };
+  }, []);
+
+  const copyToClipboard = useCallback(async (text: string) => {
+    const ok = await copyTextWithFallback(text);
+    showToast(ok ? '已完成复制' : '复制失败，请检查浏览器权限', ok ? 'success' : 'error');
+  }, [showToast]);
 
   const openSummary = (content: string, title = 'Summary Details', downloadUrl = '') => {
     setSummaryContent(content); setSummaryTitle(title); setSummaryDownloadUrl(downloadUrl); setSummaryModalOpen(true);
@@ -1173,7 +1192,9 @@ export default function App() {
   return (
     <div className="flex h-screen w-full overflow-hidden font-sans">
       <SummaryModal isOpen={summaryModalOpen} onClose={() => { setSummaryModalOpen(false); setSummaryDownloadUrl(''); }} content={summaryContent} title={summaryTitle}
-        onDownload={summaryDownloadUrl ? () => window.open(summaryDownloadUrl, '_blank') : undefined} />
+        onDownload={summaryDownloadUrl ? () => window.open(summaryDownloadUrl, '_blank') : undefined}
+        onCopy={copyToClipboard}
+      />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onProvidersChange={() => listLLMProviders().then(setProviders).catch(() => {})} />
       <NewDebateModal isOpen={newDebateOpen} onClose={() => setNewDebateOpen(false)} onCreated={(d) => { refreshList(); setActiveId(d.id); }} />
       <AgentConfigModal
@@ -1183,7 +1204,25 @@ export default function App() {
         discussionId={activeId}
         onSave={(updated) => setAgents(prev => prev.map(a => a.id === updated.id ? updated : a))}
         providers={providers}
+        onCopy={copyToClipboard}
       />
+      <AnimatePresence>
+        {toast && (
+          <motion.div
+            key={toast.id}
+            initial={{ opacity: 0, y: -12, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -8, scale: 0.98 }}
+            className={`fixed top-5 left-1/2 -translate-x-1/2 z-[90] px-4 py-2 rounded-lg text-sm font-medium shadow-lg border ${
+              toast.type === 'success'
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-200 dark:border-emerald-700/40'
+                : 'bg-red-50 text-red-700 border-red-200 dark:bg-red-900/30 dark:text-red-200 dark:border-red-700/40'
+            }`}
+          >
+            {toast.text}
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Sidebar */}
       <motion.aside
@@ -1521,7 +1560,7 @@ export default function App() {
                             <Pencil className="w-3 h-3" />
                           </button>
                         )}
-                        <button onClick={() => copyToClipboard(msg.content)}
+                        <button onClick={() => { void copyToClipboard(msg.content); }}
                           className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-blue-500 hover:scale-110 transition" title="Copy">
                           <Copy className="w-3 h-3" />
                         </button>
@@ -1702,7 +1741,7 @@ export default function App() {
               <div className="relative glass-card rounded-xl rounded-tl-none p-3 shadow-sm border border-slate-200/50 dark:border-slate-700/50">
                 <MarkdownRenderer content={msg.content} />
                 <div className="absolute -bottom-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                  <button onClick={() => copyToClipboard(msg.content)}
+                  <button onClick={() => { void copyToClipboard(msg.content); }}
                     className="p-1 bg-white dark:bg-slate-700 rounded-full shadow-sm text-slate-400 hover:text-blue-500 hover:scale-110 transition" title="Copy">
                     <Copy className="w-3 h-3" />
                   </button>
