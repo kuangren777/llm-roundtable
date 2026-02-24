@@ -119,6 +119,14 @@ class UserInputRequest(BaseModel):
     content: str
 
 
+class TruncateMessagesRequest(BaseModel):
+    message_id: Optional[int] = None
+
+
+class TruncateMessagesResponse(BaseModel):
+    deleted_count: int
+
+
 class ObserverChatRequest(BaseModel):
     content: str
     provider: str
@@ -207,6 +215,7 @@ class DiscussionEvent(BaseModel):
     content: Optional[str] = None
     phase: Optional[str] = None
     round_number: Optional[int] = None
+    message_id: Optional[int] = None
     cycle_index: Optional[int] = None
     created_at: Optional[datetime] = None
     # LLM streaming progress fields

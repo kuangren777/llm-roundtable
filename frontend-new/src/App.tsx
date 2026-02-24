@@ -43,7 +43,7 @@ import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, SummaryEven
 import {
   listDiscussions, getDiscussion, deleteDiscussion, stopDiscussion, resetDiscussion,
   prepareAgents, generateTitle, submitUserInput, deleteMessage, updateMessage, updateTopic,
-  streamDiscussion, streamSummarize, streamObserverChat,
+  truncateMessagesAfter, streamDiscussion, streamSummarize, streamObserverChat,
   listLLMProviders, getObserverHistory, clearObserverHistory,
 } from './services/api';
 import { SettingsModal } from './components/SettingsModal';
@@ -663,7 +663,7 @@ export default function App() {
 
   // --- Handlers ---
 
-  const startDiscussionStream = useCallback(async () => {
+  const startDiscussionStream = useCallback(async (options?: { singleRound?: boolean | null }) => {
     if (!activeId) return;
     if (pollRef.current) {
       clearInterval(pollRef.current);
@@ -781,6 +781,7 @@ export default function App() {
           refreshList();
         });
       },
+      options,
     );
     streamRef.current = controller;
   }, [activeId, phase, persistLiveState, removeLiveState, refreshList]);
@@ -1123,6 +1124,85 @@ export default function App() {
     }
     return messages;
   }, [messages, detail]);
+
+  const handleSaveEditedUserMessage = useCallback(async (msg: MessageResponse, displayIndex: number) => {
+    if (!activeId) return;
+    if (discStatus === 'running') {
+      showToast('讨论进行中，请先暂停后再编辑', 'error');
+      return;
+    }
+
+    const nextText = editingContent.trim();
+    if (!nextText || nextText === msg.content) {
+      setEditingMsgIdx(null);
+      return;
+    }
+
+    const msgId = typeof (msg as any).id === 'number' ? (msg as any).id as number : null;
+    const isTopicMessage = msgId == null;
+    const followingDisplayCount = Math.max(0, displayMessages.length - displayIndex - 1);
+    if (followingDisplayCount > 0) {
+      const confirmed = window.confirm(
+        `编辑后将删除后续 ${followingDisplayCount} 条消息，并基于新内容重新生成一轮，是否继续？`,
+      );
+      if (!confirmed) return;
+    }
+
+    try {
+      if (isTopicMessage) {
+        await updateTopic(activeId, nextText);
+      } else {
+        await updateMessage(activeId, msgId, nextText);
+      }
+      await truncateMessagesAfter(activeId, isTopicMessage ? null : msgId);
+
+      if (isTopicMessage) {
+        setMessages([]);
+        if (detail) setDetail({ ...detail, topic: nextText });
+      } else {
+        setMessages(prev => {
+          const idx = prev.findIndex(m => m.id === msgId);
+          if (idx < 0) return prev;
+          return prev
+            .slice(0, idx + 1)
+            .map((m, i) => (i === idx ? { ...m, content: nextText, summary: null } : m));
+        });
+      }
+
+      setEditingMsgIdx(null);
+      setStreamingSummaries({});
+      setSummarizing(false);
+      setSummaryProgress('');
+      setSummarizingMsgId(null);
+      setLlmProgress(null);
+      setStreamingContent({});
+      setPhase('');
+      setError(null);
+      setDiscStatus('waiting_input');
+      removeLiveState(activeId);
+
+      showToast(
+        followingDisplayCount > 0
+          ? `已删除后续 ${followingDisplayCount} 条消息，${(detail?.status === 'completed') ? '正在补跑一轮' : '按原轮次继续讨论'}`
+          : ((detail?.status === 'completed') ? '修改已保存，正在补跑一轮' : '修改已保存，按原轮次继续讨论'),
+      );
+      const shouldRunSingleRound = detail?.status === 'completed';
+      startDiscussionStream({ singleRound: shouldRunSingleRound });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '修改失败');
+      showToast('修改失败', 'error');
+    }
+  }, [
+    activeId,
+    detail,
+    discStatus,
+    displayMessages.length,
+    editingContent,
+    removeLiveState,
+    showToast,
+    startDiscussionStream,
+  ]);
+
   const unsummarizedCount = messages.filter(
     m => m.agent_role !== 'user' && (m.content || '').length >= 200 && !m.summary,
   ).length;
@@ -1506,26 +1586,12 @@ export default function App() {
                                 autoFocus />
                               <div className="flex gap-2 justify-end">
                                 <button onClick={() => setEditingMsgIdx(null)} className="px-2 py-1 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"><X className="w-3 h-3" /></button>
-                                <button onClick={async () => {
-                                  if (!activeId) return;
-                                  const nextText = editingContent.trim();
-                                  if (!nextText || nextText === msg.content) {
-                                    setEditingMsgIdx(null);
-                                    return;
-                                  }
-                                  try {
-                                    if (msg.id) {
-                                      await updateMessage(activeId, msg.id, nextText);
-                                      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, content: nextText } : m));
-                                    } else {
-                                      await updateTopic(activeId, nextText);
-                                      if (detail) setDetail({ ...detail, topic: nextText });
-                                    }
-                                    setEditingMsgIdx(null);
-                                  } catch (e: unknown) {
-                                    setError(e instanceof Error ? e.message : '修改失败');
-                                  }
-                                }} className="px-2 py-1 text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"><Check className="w-3 h-3" /></button>
+                                <button
+                                  onClick={() => { void handleSaveEditedUserMessage(msg, idx); }}
+                                  className="px-2 py-1 text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
+                                >
+                                  <Check className="w-3 h-3" />
+                                </button>
                               </div>
                             </div>
                           ) : <MarkdownRenderer content={msg.content} />

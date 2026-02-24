@@ -868,7 +868,11 @@ async def _resolve_agents(discussion: Discussion) -> list[dict]:
 
 
 
-async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator[DiscussionEvent, None]:
+async def run_discussion(
+    db: AsyncSession,
+    discussion_id: int,
+    force_single_round: bool | None = None,
+) -> AsyncGenerator[DiscussionEvent, None]:
     """Run the discussion and yield SSE events."""
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
@@ -909,11 +913,25 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         and ((getattr(m, "phase", "") or "") != "user_input")
         for m in (discussion.messages or [])
     )
-    single_round_mode = (
+    auto_single_round_mode = (
         discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
         and has_non_user_history
     )
-    if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED) and not has_non_user_history:
+    if force_single_round is None:
+        single_round_mode = auto_single_round_mode
+    else:
+        single_round_mode = bool(force_single_round)
+        logger.info(
+            "Discussion %d running in forced %s mode",
+            discussion_id,
+            "single-round" if single_round_mode else "full-round",
+        )
+
+    if (
+        force_single_round is None
+        and discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
+        and not has_non_user_history
+    ):
         logger.warning(
             "Discussion %d is %s but has no non-user history; treating as initial full-round run",
             discussion_id,
@@ -1709,6 +1727,55 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
     })
 
     return msg
+
+
+async def truncate_messages_after(
+    db: AsyncSession,
+    discussion_id: int,
+    message_id: int | None,
+) -> int | None:
+    """Delete all messages after the given anchor message (or all when anchor is None)."""
+    discussion = await get_discussion(db, discussion_id)
+    if not discussion:
+        return None
+
+    anchor_msg: Message | None = None
+    if message_id is not None:
+        anchor_result = await db.execute(
+            select(Message).where(
+                Message.id == message_id,
+                Message.discussion_id == discussion_id,
+            )
+        )
+        anchor_msg = anchor_result.scalar_one_or_none()
+        if not anchor_msg:
+            return None
+
+    delete_query = select(Message).where(Message.discussion_id == discussion_id)
+    if anchor_msg is not None:
+        delete_query = delete_query.where(Message.id > anchor_msg.id)
+    to_delete = (await db.execute(delete_query)).scalars().all()
+
+    for msg in to_delete:
+        await db.delete(msg)
+
+    remaining_query = select(Message.round_number).where(
+        Message.discussion_id == discussion_id,
+        Message.agent_role != AgentRole.USER,
+    )
+    if anchor_msg is not None:
+        remaining_query = remaining_query.where(Message.id <= anchor_msg.id)
+    remaining_rounds = [r for r in (await db.execute(remaining_query)).scalars().all() if r is not None]
+
+    discussion.final_summary = None
+    discussion.status = DiscussionStatus.WAITING_INPUT
+    discussion.current_round = (max(remaining_rounds) + 1) if remaining_rounds else 0
+
+    _pending_user_messages.pop(discussion_id, None)
+    _manual_pause_requests.discard(discussion_id)
+
+    await db.commit()
+    return len(to_delete)
 
 
 async def delete_user_message(db: AsyncSession, discussion_id: int, message_id: int) -> bool:

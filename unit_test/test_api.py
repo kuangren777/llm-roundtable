@@ -381,6 +381,88 @@ async def test_user_input_cycle_index_increments_after_completion(client):
     assert user_msgs[2]["cycle_index"] == 1
 
 
+async def test_truncate_after_message_deletes_following_messages(client):
+    create_res = await client.post("/api/discussions/", json={"topic": "Truncate test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    await client.post(f"/api/discussions/{disc_id}/user-input", json={"content": "A"})
+    await client.post(f"/api/discussions/{disc_id}/user-input", json={"content": "B"})
+
+    detail = await client.get(f"/api/discussions/{disc_id}")
+    msgs = detail.json()["messages"]
+    assert len(msgs) >= 3
+    anchor_id = msgs[0]["id"]  # initial topic user message
+
+    res = await client.post(
+        f"/api/discussions/{disc_id}/messages/truncate-after",
+        json={"message_id": anchor_id},
+    )
+    assert res.status_code == 200
+    assert res.json()["deleted_count"] >= 2
+
+    detail_after = await client.get(f"/api/discussions/{disc_id}")
+    msgs_after = detail_after.json()["messages"]
+    assert len(msgs_after) == 1
+    assert msgs_after[0]["id"] == anchor_id
+
+
+async def test_truncate_with_null_anchor_deletes_all_messages(client):
+    create_res = await client.post("/api/discussions/", json={"topic": "Truncate all test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+    await client.post(f"/api/discussions/{disc_id}/user-input", json={"content": "A"})
+
+    res = await client.post(
+        f"/api/discussions/{disc_id}/messages/truncate-after",
+        json={"message_id": None},
+    )
+    assert res.status_code == 200
+    assert res.json()["deleted_count"] >= 1
+
+    detail_after = await client.get(f"/api/discussions/{disc_id}")
+    assert detail_after.status_code == 200
+    assert detail_after.json()["messages"] == []
+
+
+async def test_run_supports_single_round_query_param(client, monkeypatch):
+    from backend.app.schemas.schemas import DiscussionEvent
+
+    observed = {"force_single_round": None}
+
+    async def fake_run_discussion(_db, _discussion_id, force_single_round: bool = False):
+        observed["force_single_round"] = force_single_round
+        yield DiscussionEvent(event_type="cycle_complete", content="ok")
+
+    monkeypatch.setattr("backend.app.api.discussions.run_discussion", fake_run_discussion)
+
+    create_res = await client.post("/api/discussions/", json={"topic": "Single round flag test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    res = await client.post(f"/api/discussions/{disc_id}/run?single_round=true")
+    assert res.status_code == 200
+    assert observed["force_single_round"] is True
+    assert "cycle_complete" in res.text
+
+
+async def test_run_supports_force_full_round_query_param(client, monkeypatch):
+    from backend.app.schemas.schemas import DiscussionEvent
+
+    observed = {"force_single_round": None}
+
+    async def fake_run_discussion(_db, _discussion_id, force_single_round=None):
+        observed["force_single_round"] = force_single_round
+        yield DiscussionEvent(event_type="complete", content="ok")
+
+    monkeypatch.setattr("backend.app.api.discussions.run_discussion", fake_run_discussion)
+
+    create_res = await client.post("/api/discussions/", json={"topic": "Force full flag test", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    res = await client.post(f"/api/discussions/{disc_id}/run?single_round=false")
+    assert res.status_code == 200
+    assert observed["force_single_round"] is False
+    assert "complete" in res.text
+
+
 # --- Observer tests ---
 
 async def test_observer_history_empty(client):

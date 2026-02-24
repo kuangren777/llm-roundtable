@@ -7,7 +7,19 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..database import get_db
-from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse, UserInputRequest, AttachMaterialsRequest
+from ..schemas.schemas import (
+    DiscussionCreate,
+    DiscussionResponse,
+    DiscussionDetail,
+    DiscussionEvent,
+    AgentConfigUpdate,
+    AgentConfigResponse,
+    MaterialResponse,
+    UserInputRequest,
+    AttachMaterialsRequest,
+    TruncateMessagesRequest,
+    TruncateMessagesResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +42,7 @@ from ..services.discussion_service import (
     attach_library_materials,
     summarize_discussion_messages,
     delete_user_message,
+    truncate_messages_after,
     update_user_message,
     update_discussion_topic,
     reset_discussion,
@@ -93,7 +106,11 @@ async def generate_title_endpoint(discussion_id: int, db: AsyncSession = Depends
 
 
 @router.post("/{discussion_id}/run")
-async def run_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
+async def run_discussion_endpoint(
+    discussion_id: int,
+    single_round: bool | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Run a discussion and stream events via SSE."""
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
@@ -101,7 +118,7 @@ async def run_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends
 
     async def event_stream():
         try:
-            async for event in run_discussion(db, discussion_id):
+            async for event in run_discussion(db, discussion_id, force_single_round=single_round):
                 data = event.model_dump_json()
                 yield f"data: {data}\n\n"
         except Exception as e:
@@ -184,6 +201,19 @@ async def delete_message_endpoint(discussion_id: int, message_id: int, db: Async
     deleted = await delete_user_message(db, discussion_id, message_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Message not found")
+
+
+@router.post("/{discussion_id}/messages/truncate-after", response_model=TruncateMessagesResponse)
+async def truncate_after_message_endpoint(
+    discussion_id: int,
+    data: TruncateMessagesRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all messages after a message id (or all if message_id is null)."""
+    deleted_count = await truncate_messages_after(db, discussion_id, data.message_id)
+    if deleted_count is None:
+        raise HTTPException(status_code=404, detail="Discussion or message not found")
+    return {"deleted_count": deleted_count}
 
 
 @router.put("/{discussion_id}/messages/{message_id}")
