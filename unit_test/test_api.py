@@ -1,4 +1,5 @@
 """Tests for FastAPI API endpoints using httpx AsyncClient."""
+import json
 
 
 async def test_health_check(client):
@@ -64,6 +65,12 @@ async def test_get_discussion_detail(client):
     data = res.json()
     assert data["topic"] == "Detail test"
     assert "messages" in data
+    assert any(
+        m["agent_role"] == "user"
+        and m["phase"] == "user_input"
+        and m["content"] == "Detail test"
+        for m in data["messages"]
+    )
     assert len(data["agents"]) == 2
 
 
@@ -122,6 +129,21 @@ async def test_delete_discussion(client):
 async def test_delete_discussion_not_found(client):
     res = await client.delete("/api/discussions/9999")
     assert res.status_code == 404
+
+
+async def test_stop_discussion_returns_paused_status(client):
+    payload = {
+        "topic": "Pause behavior test",
+        "mode": "custom",
+        "agents": [{"name": "Host", "role": "host"}],
+    }
+    create_res = await client.post("/api/discussions/", json=payload)
+    assert create_res.status_code == 200
+    disc_id = create_res.json()["id"]
+
+    stop_res = await client.post(f"/api/discussions/{disc_id}/stop")
+    assert stop_res.status_code == 200
+    assert stop_res.json()["status"] == "paused"
 
 
 async def test_create_discussion_auto_mode(client):
@@ -348,9 +370,15 @@ async def test_user_input_cycle_index_increments_after_completion(client):
     detail = await client.get(f"/api/discussions/{disc_id}")
     assert detail.status_code == 200
     user_msgs = [m for m in detail.json()["messages"] if m["agent_role"] == "user"]
-    assert len(user_msgs) == 2
+    # Includes initial topic message + two explicit user inputs.
+    assert len(user_msgs) == 3
+    assert user_msgs[0]["content"] == "Cycle test"
+    assert user_msgs[0]["phase"] == "user_input"
     assert user_msgs[0]["cycle_index"] == 0
-    assert user_msgs[1]["cycle_index"] == 1
+    assert user_msgs[1]["content"] == "第一条输入"
+    assert user_msgs[1]["cycle_index"] == 0
+    assert user_msgs[2]["content"] == "第二条输入"
+    assert user_msgs[2]["cycle_index"] == 1
 
 
 # --- Observer tests ---
@@ -407,3 +435,43 @@ async def test_observer_history_in_discussion_detail(client):
     data = res.json()
     assert "observer_messages" in data
     assert data["observer_messages"] == []
+
+
+async def test_summarize_stream_supports_double_encoded_summary_model_setting(client, monkeypatch):
+    """Regression: summary_model may be stored as a double-encoded JSON string."""
+    provider = await client.post("/api/llm-providers/", json={"name": "OpenAI", "provider": "openai"})
+    pid = provider.json()["id"]
+    await client.post(f"/api/llm-providers/{pid}/models", json={"model": "gpt-4o-mini"})
+
+    # Simulate legacy bad value in DB: json string wrapped in another json string.
+    raw_cfg = json.dumps({"provider_id": pid, "provider": "openai", "model": "gpt-4o-mini"})
+    await client.put("/api/settings/summary_model", json={"value": raw_cfg})
+
+    topic = "这是一个用于触发消息总结的超长话题。" * 30
+    create_res = await client.post("/api/discussions/", json={"topic": topic, "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    async def fake_call_llm_stream(*args, on_chunk=None, **kwargs):
+        if on_chunk:
+            await on_chunk("第一句。", 4)
+            await on_chunk("第二句。", 8)
+        return "第一句。第二句。", 8
+
+    monkeypatch.setattr("backend.app.services.discussion_service.call_llm_stream", fake_call_llm_stream)
+
+    res = await client.post(f"/api/discussions/{disc_id}/summarize")
+    assert res.status_code == 200
+
+    events = []
+    for line in res.text.splitlines():
+        if line.startswith("data: "):
+            events.append(json.loads(line[6:]))
+
+    assert any(e.get("event_type") == "summary_chunk" for e in events)
+    assert any(e.get("event_type") == "summary_done" for e in events)
+
+    detail = await client.get(f"/api/discussions/{disc_id}")
+    assert detail.status_code == 200
+    user_msgs = [m for m in detail.json()["messages"] if m["agent_role"] == "user"]
+    assert user_msgs
+    assert user_msgs[0]["summary"] == "第一句。第二句。"

@@ -10,6 +10,8 @@ from ..database import get_db
 from ..schemas.schemas import DiscussionCreate, DiscussionResponse, DiscussionDetail, DiscussionEvent, AgentConfigUpdate, AgentConfigResponse, MaterialResponse, UserInputRequest, AttachMaterialsRequest
 
 logger = logging.getLogger(__name__)
+
+_active_summarize_discussions: set[int] = set()
 from ..services.discussion_service import (
     create_discussion,
     get_discussion,
@@ -29,6 +31,7 @@ from ..services.discussion_service import (
     summarize_discussion_messages,
     delete_user_message,
     update_user_message,
+    update_discussion_topic,
     reset_discussion,
 )
 
@@ -111,11 +114,11 @@ async def run_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends
 
 @router.post("/{discussion_id}/stop")
 async def stop_discussion_endpoint(discussion_id: int, db: AsyncSession = Depends(get_db)):
-    """Stop a running discussion — cancels the graph task and resets status."""
+    """Pause a discussion so it can be resumed later."""
     ok = await stop_discussion(db, discussion_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Discussion not found")
-    return {"status": "stopped"}
+    return {"status": "paused"}
 
 
 @router.post("/{discussion_id}/reset")
@@ -145,12 +148,22 @@ async def summarize_discussion_endpoint(discussion_id: int, db: AsyncSession = D
     if not discussion:
         raise HTTPException(status_code=404, detail="Discussion not found")
 
+    if discussion_id in _active_summarize_discussions:
+        async def busy_stream():
+            yield f"data: {DiscussionEvent(event_type='summary_complete', content='总结任务进行中，已忽略重复触发').model_dump_json()}\n\n"
+        return StreamingResponse(busy_stream(), media_type="text/event-stream")
+
+    _active_summarize_discussions.add(discussion_id)
+
     async def event_stream():
         try:
             async for event in summarize_discussion_messages(db, discussion_id):
                 yield f"data: {event.model_dump_json()}\n\n"
         except Exception as e:
             logger.warning("Summarize stream error for discussion %d: %s", discussion_id, e)
+            yield f"data: {DiscussionEvent(event_type='error', content=str(e)).model_dump_json()}\n\n"
+        finally:
+            _active_summarize_discussions.discard(discussion_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -180,6 +193,14 @@ async def update_message_endpoint(discussion_id: int, message_id: int, data: Use
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     return {"id": msg.id, "content": msg.content}
+
+
+@router.put("/{discussion_id}/topic")
+async def update_topic_endpoint(discussion_id: int, data: UserInputRequest, db: AsyncSession = Depends(get_db)):
+    disc = await update_discussion_topic(db, discussion_id, data.content)
+    if not disc:
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    return {"id": disc.id, "topic": disc.topic}
 
 
 # --- Material endpoints ---

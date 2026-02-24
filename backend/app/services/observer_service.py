@@ -23,6 +23,9 @@ OBSERVER_SYSTEM_PROMPT = """你是一位独立的圆桌讨论观察员。你能�
 
 请用简洁、专业的语言回答。如果讨论还在进行中，请基于目前已有的内容进行分析。"""
 
+OBSERVER_MAX_CONTEXT_CHARS = 60000
+OBSERVER_MAX_HISTORY_TURNS = 12
+
 
 async def get_observer_history(db: AsyncSession, discussion_id: int) -> list[ObserverMessage]:
     result = await db.execute(
@@ -40,16 +43,45 @@ async def clear_observer_history(db: AsyncSession, discussion_id: int) -> None:
     await db.commit()
 
 
-def _build_discussion_context(discussion: Discussion, messages: list[Message]) -> str:
-    """Build a text summary of the discussion for the observer's context window."""
-    lines = [f"讨论主题: {discussion.topic}", f"讨论模式: {discussion.mode.value}", ""]
-    for msg in messages:
+def _build_discussion_context(
+    discussion: Discussion,
+    messages: list[Message],
+    max_chars: int = OBSERVER_MAX_CONTEXT_CHARS,
+) -> str:
+    """Build a bounded context window for observer chat (latest-first truncation)."""
+    header_lines = [f"讨论主题: {discussion.topic}", f"讨论模式: {discussion.mode.value}", ""]
+
+    selected_lines_reversed: list[str] = []
+    consumed = 0
+    selected_count = 0
+
+    for msg in reversed(messages):
         role_label = {"host": "主持人", "panelist": "专家", "critic": "批评家", "user": "用户"}.get(msg.agent_role.value, msg.agent_role.value)
-        # Use summary if available (for long messages), otherwise full content
-        text = msg.summary or msg.content
-        lines.append(f"[{role_label} - {msg.agent_name}] {text}")
+        text = (msg.summary or msg.content or "").strip()
+        line = f"[{role_label} - {msg.agent_name}] {text}"
+        line_len = len(line) + 1
+
+        if consumed + line_len > max_chars:
+            # Keep latest contiguous window; stop once budget is exhausted.
+            break
+        selected_lines_reversed.append(line)
+        consumed += line_len
+        selected_count += 1
+
+    selected_lines = list(reversed(selected_lines_reversed))
+    omitted = max(0, len(messages) - selected_count)
+
+    lines = header_lines
+    if omitted > 0:
+        lines.append(f"（上下文已裁剪，省略较早消息 {omitted} 条，仅保留最近 {selected_count} 条）")
+        lines.append("")
+    lines.extend(selected_lines)
+
     if discussion.final_summary:
-        lines.append(f"\n最终总结: {discussion.final_summary}")
+        final_summary = discussion.final_summary.strip()
+        if len(final_summary) > 4000:
+            final_summary = final_summary[:4000] + "..."
+        lines.append(f"\n最终总结: {final_summary}")
     return "\n".join(lines)
 
 
@@ -111,7 +143,9 @@ async def chat_with_observer(
         {"role": "assistant", "content": "好的，我已经仔细阅读了以上讨论的全部内容。请问你想了解什么？"},
     ]
     # Add prior observer conversation (skip the just-added user message — it goes last)
-    for om in observer_history:
+    # Keep only recent turns to avoid prompt explosion.
+    history_tail = observer_history[-OBSERVER_MAX_HISTORY_TURNS:]
+    for om in history_tail:
         if om.id == user_msg.id:
             continue
         llm_messages.append({

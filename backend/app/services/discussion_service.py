@@ -7,7 +7,7 @@ import shutil
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 from fastapi import UploadFile
 
@@ -17,19 +17,24 @@ from ..database import async_session
 from .discussion_engine import build_discussion_graph, AgentInfo, DiscussionState, progress_queue_var, _pending_user_messages
 from .mode_templates import get_mode_template, assign_llms_to_agents
 from .planner import plan_agents
-from .llm_service import call_llm
+from .llm_service import call_llm, call_llm_stream
 
 logger = logging.getLogger(__name__)
 
 GRAPH_EVENT = "graph_event"
 PROGRESS_EVENT = "progress_event"
 USER_MSG_CONSUMED = "user_message_consumed"
+NODE_MESSAGE_EVENT = "node_message"
 GRAPH_DONE = "graph_done"
 
 # Track running graph tasks so they can be cancelled by the stop endpoint
 _running_tasks: dict[int, asyncio.Task] = {}
 # Track drain tasks (background DB writers after SSE disconnect)
 _drain_tasks: dict[int, asyncio.Task] = {}
+# Manual pause requests issued via stop endpoint (used to override final status).
+_manual_pause_requests: set[int] = set()
+# Live SSE subscribers for running discussions (supports reconnect/reattach)
+_live_subscribers: dict[int, set[asyncio.Queue]] = {}
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "uploads")
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
@@ -38,6 +43,112 @@ ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # Minimum content length to trigger summarization (short messages don't need it)
 MIN_SUMMARY_LENGTH = 200
+
+RUNNING_DISCUSSION_STATUSES = {
+    DiscussionStatus.PLANNING,
+    DiscussionStatus.DISCUSSING,
+    DiscussionStatus.REFLECTING,
+    DiscussionStatus.SYNTHESIZING,
+}
+
+
+async def _broadcast_discussion_event(discussion_id: int, event: DiscussionEvent):
+    subscribers = list(_live_subscribers.get(discussion_id, set()))
+    for q in subscribers:
+        try:
+            q.put_nowait(event)
+        except Exception:
+            continue
+
+
+async def _stream_running_discussion_events(
+    db: AsyncSession, discussion_id: int, degraded_db_polling: bool = False
+) -> AsyncGenerator[DiscussionEvent, None]:
+    """Attach to an already-running discussion and stream live backend events."""
+    q: asyncio.Queue | None = None
+    if not degraded_db_polling:
+        q = asyncio.Queue()
+        _live_subscribers.setdefault(discussion_id, set()).add(q)
+    try:
+        discussion = await get_discussion(db, discussion_id)
+        if discussion:
+            event = DiscussionEvent(
+                event_type="phase_change",
+                phase=discussion.status,
+                content="reconnected" if not degraded_db_polling else "reconnected (degraded polling mode)",
+            )
+            yield event
+        else:
+            yield DiscussionEvent(event_type="error", content="Discussion not found")
+            return
+
+        last_phase = discussion.status
+        seen_message_ids: set[int] = {m.id for m in (discussion.messages or []) if m.id is not None}
+
+        async def _refresh_discussion() -> Discussion | None:
+            # Read with a fresh DB session to avoid stale ORM identity-map state.
+            async with async_session() as fresh_db:
+                return await get_discussion(fresh_db, discussion_id)
+
+        while True:
+            if q is not None:
+                try:
+                    evt = await asyncio.wait_for(q.get(), timeout=2.0)
+                    yield evt
+                    if evt.event_type in ("complete", "cycle_complete", "error"):
+                        break
+                    continue
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(1.0)
+
+            discussion = await _refresh_discussion()
+            if not discussion:
+                yield DiscussionEvent(event_type="error", content="Discussion not found")
+                break
+
+            # Degraded mode: poll DB for new persisted messages and stream them.
+            if degraded_db_polling:
+                messages = sorted((discussion.messages or []), key=lambda m: m.id or 0)
+                for msg in messages:
+                    if msg.id is None or msg.id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(msg.id)
+                    yield DiscussionEvent(
+                        event_type="message",
+                        agent_name=msg.agent_name,
+                        agent_role=msg.agent_role,
+                        content=msg.content,
+                        phase=msg.phase or "",
+                        round_number=msg.round_number,
+                        message_id=msg.id,
+                        cycle_index=msg.cycle_index,
+                        created_at=msg.created_at,
+                    )
+
+            if discussion.status in RUNNING_DISCUSSION_STATUSES and discussion.status != last_phase:
+                last_phase = discussion.status
+                yield DiscussionEvent(event_type="phase_change", phase=discussion.status, content="status_sync")
+
+            if discussion.status not in RUNNING_DISCUSSION_STATUSES:
+                if not discussion:
+                    yield DiscussionEvent(event_type="error", content="Discussion not found")
+                    break
+                if discussion.status == DiscussionStatus.COMPLETED:
+                    yield DiscussionEvent(event_type="complete", content="discussion completed")
+                elif discussion.status == DiscussionStatus.WAITING_INPUT:
+                    yield DiscussionEvent(event_type="cycle_complete", content="cycle completed")
+                elif discussion.status == DiscussionStatus.FAILED:
+                    yield DiscussionEvent(event_type="error", content="Discussion failed")
+                break
+    finally:
+        if q is not None:
+            subscribers = _live_subscribers.get(discussion_id)
+            if subscribers is not None:
+                subscribers.discard(q)
+                if not subscribers:
+                    _live_subscribers.pop(discussion_id, None)
 
 
 async def _get_summary_model_config() -> dict | None:
@@ -51,10 +162,20 @@ async def _get_summary_model_config() -> dict | None:
             return None
         try:
             cfg = json.loads(setting.value)
+            # Backward compatibility: some old values were double-encoded JSON strings.
+            if isinstance(cfg, str):
+                cfg = json.loads(cfg)
         except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(cfg, dict):
             return None
         # Resolve api_key/base_url from provider table
         provider_id = cfg.get("provider_id")
+        if isinstance(provider_id, str):
+            try:
+                provider_id = int(provider_id)
+            except ValueError:
+                provider_id = None
         if provider_id:
             prov_result = await db.execute(
                 select(LLMProvider).where(LLMProvider.id == provider_id)
@@ -138,6 +259,18 @@ async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discuss
     db.add(discussion)
     await db.flush()
 
+    # Persist the initial user input so the chat shows the user's starting request immediately.
+    initial_user_msg = Message(
+        discussion_id=discussion.id,
+        agent_name="User",
+        agent_role=AgentRole.USER,
+        content=data.topic,
+        round_number=0,
+        cycle_index=0,
+        phase="user_input",
+    )
+    db.add(initial_user_msg)
+
     # Custom mode: create agents from explicit agent list
     if data.mode == DiscussionMode.CUSTOM and data.agents:
         for agent_data in data.agents:
@@ -171,6 +304,17 @@ async def get_discussion(db: AsyncSession, discussion_id: int) -> Discussion | N
         .where(Discussion.id == discussion_id)
     )
     return result.scalar_one_or_none()
+
+
+async def update_discussion_topic(db: AsyncSession, discussion_id: int, topic: str) -> Discussion | None:
+    result = await db.execute(select(Discussion).where(Discussion.id == discussion_id))
+    disc = result.scalar_one_or_none()
+    if not disc:
+        return None
+    disc.topic = topic
+    await db.commit()
+    await db.refresh(disc)
+    return disc
 
 
 async def list_discussions(db: AsyncSession) -> list[Discussion]:
@@ -728,23 +872,65 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
     """Run the discussion and yield SSE events."""
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
-        yield DiscussionEvent(event_type="error", content="Discussion not found")
+        event = DiscussionEvent(event_type="error", content="Discussion not found")
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
         return
+
+    # Reattach mode: allow clients to subscribe to a currently running discussion.
+    if discussion.status in RUNNING_DISCUSSION_STATUSES:
+        if discussion_id in _running_tasks or discussion_id in _drain_tasks:
+            async for event in _stream_running_discussion_events(db, discussion_id, degraded_db_polling=False):
+                yield event
+            return
+        logger.warning(
+            "Discussion %d is marked running but no local task is available; "
+            "recovering to waiting_input and starting a resumable run",
+            discussion_id,
+        )
+        # Recover from unexpected runtime interruption (process restart, worker crash, etc.)
+        # so the user can continue from current persisted history.
+        discussion.status = DiscussionStatus.WAITING_INPUT
+        await db.commit()
 
     if discussion.status not in (DiscussionStatus.CREATED, DiscussionStatus.FAILED, DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED):
-        yield DiscussionEvent(event_type="error", content="Discussion is already running")
+        event = DiscussionEvent(event_type="error", content="Discussion is already running")
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
         return
 
-    # WAITING_INPUT/COMPLETED follow-up runs are always single-round.
-    single_round_mode = discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
+    # Starting a new run consumes any stale pause flag from previous runs.
+    _manual_pause_requests.discard(discussion_id)
+
+    # WAITING_INPUT/COMPLETED follow-up runs are single-round (one round per user message),
+    # but only after at least one non-user discussion message exists.
+    has_non_user_history = any(
+        (getattr(m, "agent_role", None) != AgentRole.USER)
+        and ((getattr(m, "phase", "") or "") != "user_input")
+        for m in (discussion.messages or [])
+    )
+    single_round_mode = (
+        discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
+        and has_non_user_history
+    )
+    if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED) and not has_non_user_history:
+        logger.warning(
+            "Discussion %d is %s but has no non-user history; treating as initial full-round run",
+            discussion_id,
+            discussion.status,
+        )
     carry_history = discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED)
 
     # Resolve agents if not yet generated (non-custom modes)
     if not discussion.agents:
-        yield DiscussionEvent(event_type="phase_change", phase="planning", content="正在生成专家团队...")
+        event = DiscussionEvent(event_type="phase_change", phase="planning", content="正在生成专家团队...")
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
         agents_list = await prepare_agents(db, discussion_id)
         if not agents_list:
-            yield DiscussionEvent(event_type="error", content="No agents available for discussion")
+            event = DiscussionEvent(event_type="error", content="No agents available for discussion")
+            await _broadcast_discussion_event(discussion_id, event)
+            yield event
             return
         await db.refresh(discussion, ["agents"])
 
@@ -762,7 +948,9 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         ))
 
     if not agents:
-        yield DiscussionEvent(event_type="error", content="No agents available for discussion")
+        event = DiscussionEvent(event_type="error", content="No agents available for discussion")
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
         return
 
     # Validate: at least one agent must have an API key (or use local provider)
@@ -773,16 +961,18 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
     ]
     if agents_missing_key:
         names = ", ".join(a["name"] for a in agents_missing_key)
-        yield DiscussionEvent(
+        event = DiscussionEvent(
             event_type="error",
             content=f"以下 Agent 缺少 API Key: {names}。请在「设置」中为对应的 LLM 供应商配置 API Key，或设置相应的环境变量（如 OPENAI_API_KEY）。",
         )
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
         discussion.status = DiscussionStatus.FAILED
         await db.commit()
         return
 
     # In follow-up single-round mode, user messages are already saved in DB.
-    # Clear pending queue so host_planning_node does not re-inject duplicates.
+    # Clear pending queue so graph nodes do not re-inject duplicates.
     if single_round_mode:
         _pending_user_messages.pop(discussion_id, None)
 
@@ -833,13 +1023,17 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         "intent_judgment": "",
         "host_position": "",
         "open_tasks": [],
+        "next_step_plan": "",
+        "round_summaries": [],
         "cycle_index": cycle_index,
     }
 
     discussion.status = DiscussionStatus.PLANNING
     await db.commit()
 
-    yield DiscussionEvent(event_type="phase_change", phase="planning", content="Discussion starting...")
+    event = DiscussionEvent(event_type="phase_change", phase="planning", content="Discussion starting...")
+    await _broadcast_discussion_event(discussion_id, event)
+    yield event
 
     graph = build_discussion_graph()
 
@@ -860,6 +1054,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
     _running_tasks[discussion_id] = task
 
     try:
+        persisted_message_uids: set[str] = set()
         while True:
             msg_type, payload = await queue.get()
 
@@ -868,28 +1063,74 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
 
             if msg_type == PROGRESS_EVENT:
                 # Forward LLM streaming progress
-                yield DiscussionEvent(
+                event = DiscussionEvent(
                     event_type="llm_progress",
                     agent_name=payload["agent_name"],
                     chars_received=payload["chars"],
                     llm_status=payload["status"],
                     phase=payload.get("phase", ""),
+                    content=payload.get("content"),
                 )
+                await _broadcast_discussion_event(discussion_id, event)
+                yield event
                 continue
 
             if msg_type == USER_MSG_CONSUMED:
                 # Notify frontend that a user message was consumed by the engine
-                yield DiscussionEvent(
+                event = DiscussionEvent(
                     event_type="user_message_consumed",
                     agent_name=payload.get("agent_name", "用户"),
                     content=payload.get("content", ""),
                     phase="user_input",
                 )
+                await _broadcast_discussion_event(discussion_id, event)
+                yield event
+                continue
+
+            if msg_type == NODE_MESSAGE_EVENT:
+                msg_data = payload
+                msg_uid = str(msg_data.get("message_uid") or "")
+                if msg_uid and msg_uid in persisted_message_uids:
+                    continue
+
+                msg = Message(
+                    discussion_id=discussion.id,
+                    agent_name=msg_data["agent_name"],
+                    agent_role=msg_data["agent_role"],
+                    content=msg_data["content"],
+                    round_number=msg_data.get("round_number", 0),
+                    cycle_index=msg_data.get("cycle_index", cycle_index),
+                    phase=msg_data.get("phase", ""),
+                )
+                db.add(msg)
+                await db.flush()
+                if msg_uid:
+                    persisted_message_uids.add(msg_uid)
+                await db.commit()
+
+                if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
+                    asyncio.create_task(_summarize_message_bg(msg.id))
+
+                event = DiscussionEvent(
+                    event_type="message",
+                    agent_name=msg_data["agent_name"],
+                    agent_role=msg_data["agent_role"],
+                    content=msg_data["content"],
+                    phase=msg_data.get("phase", ""),
+                    round_number=msg_data.get("round_number", 0),
+                    message_id=msg.id,
+                    cycle_index=msg_data.get("cycle_index", cycle_index),
+                    created_at=msg.created_at,
+                )
+                await _broadcast_discussion_event(discussion_id, event)
+                yield event
                 continue
 
             # GRAPH_EVENT — process node outputs
             if "_error" in payload:
-                yield DiscussionEvent(event_type="error", content=payload["_error"])
+                event = DiscussionEvent(event_type="error", content=payload["_error"])
+                await _broadcast_discussion_event(discussion_id, event)
+                yield event
                 discussion.status = DiscussionStatus.FAILED
                 await db.commit()
                 return
@@ -899,7 +1140,9 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                 error = node_output.get("error")
 
                 if error:
-                    yield DiscussionEvent(event_type="error", content=error)
+                    event = DiscussionEvent(event_type="error", content=error)
+                    await _broadcast_discussion_event(discussion_id, event)
+                    yield event
                     discussion.status = DiscussionStatus.FAILED
                     await db.commit()
                     return
@@ -913,11 +1156,25 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                     discussion.status = DiscussionStatus.REFLECTING
                 elif phase == "synthesizing":
                     discussion.status = DiscussionStatus.SYNTHESIZING
+                elif phase == "round_summary":
+                    discussion.status = DiscussionStatus.REFLECTING
+                elif phase == "next_step_planning":
+                    discussion.status = DiscussionStatus.PLANNING
 
                 # Save messages to DB and yield events
                 new_messages = node_output.get("messages", [])
                 saved_msgs = []
                 for msg_data in new_messages:
+                    msg_uid = str(msg_data.get("message_uid") or "")
+                    if msg_uid and msg_uid in persisted_message_uids:
+                        continue
+                    is_injected_user = (
+                        msg_data.get("agent_role") == AgentRole.USER
+                        and msg_data.get("phase") == "user_input"
+                    )
+                    if is_injected_user:
+                        continue
+
                     msg = Message(
                         discussion_id=discussion.id,
                         agent_name=msg_data["agent_name"],
@@ -928,21 +1185,29 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                         phase=msg_data.get("phase", ""),
                     )
                     db.add(msg)
+                    await db.flush()
                     saved_msgs.append(msg)
+                    if msg_uid:
+                        persisted_message_uids.add(msg_uid)
 
-                    yield DiscussionEvent(
+                    event = DiscussionEvent(
                         event_type="message",
                         agent_name=msg_data["agent_name"],
                         agent_role=msg_data["agent_role"],
                         content=msg_data["content"],
                         phase=msg_data.get("phase", ""),
                         round_number=msg_data.get("round_number", 0),
+                        message_id=msg.id,
                         cycle_index=msg_data.get("cycle_index", cycle_index),
                         created_at=msg.created_at,
                     )
+                    await _broadcast_discussion_event(discussion_id, event)
+                    yield event
 
                 if phase:
-                    yield DiscussionEvent(event_type="phase_change", phase=phase)
+                    event = DiscussionEvent(event_type="phase_change", phase=phase)
+                    await _broadcast_discussion_event(discussion_id, event)
+                    yield event
 
                 # Save final summary
                 if node_output.get("final_summary"):
@@ -956,15 +1221,35 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                     if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
                         asyncio.create_task(_summarize_message_bg(msg.id))
 
-        discussion.status = DiscussionStatus.WAITING_INPUT
-        await db.commit()
-        yield DiscussionEvent(event_type="cycle_complete", content="本轮讨论结束，等待您的输入后继续...")
+        manually_paused = discussion_id in _manual_pause_requests
+        if manually_paused:
+            _manual_pause_requests.discard(discussion_id)
+            discussion.status = DiscussionStatus.WAITING_INPUT
+            await db.commit()
+            event = DiscussionEvent(event_type="cycle_complete", content="讨论已暂停，可手动继续。")
+            await _broadcast_discussion_event(discussion_id, event)
+            yield event
+        elif single_round_mode:
+            discussion.status = DiscussionStatus.WAITING_INPUT
+            await db.commit()
+            event = DiscussionEvent(event_type="cycle_complete", content="增量轮次结束，等待您的下一次输入...")
+            await _broadcast_discussion_event(discussion_id, event)
+            yield event
+        else:
+            discussion.status = DiscussionStatus.COMPLETED
+            await db.commit()
+            event = DiscussionEvent(event_type="complete", content="已完成全部预设轮次，并生成最终完整总结。")
+            await _broadcast_discussion_event(discussion_id, event)
+            yield event
 
     except Exception as e:
         task.cancel()
+        logger.exception("Discussion %d failed with unhandled exception", discussion_id)
         discussion.status = DiscussionStatus.FAILED
         await db.commit()
-        yield DiscussionEvent(event_type="error", content=f"Discussion failed: {str(e)}")
+        event = DiscussionEvent(event_type="error", content=f"Discussion failed: {str(e)}")
+        await _broadcast_discussion_event(discussion_id, event)
+        yield event
     finally:
         _pending_user_messages.pop(discussion_id, None)
         progress_queue_var.reset(token)
@@ -973,7 +1258,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
         # spawn a background drain task to keep saving messages to DB.
         if not task.done():
             logger.info("SSE disconnected for discussion %d — spawning drain task", discussion_id)
-            drain = asyncio.create_task(_drain_queue(discussion_id, queue, task))
+            drain = asyncio.create_task(_drain_queue(discussion_id, queue, task, single_round_mode))
             _drain_tasks[discussion_id] = drain
         else:
             # Task finished normally — clean up
@@ -992,7 +1277,7 @@ async def run_discussion(db: AsyncSession, discussion_id: int) -> AsyncGenerator
                 pass
 
 
-async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asyncio.Task):
+async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asyncio.Task, single_round_mode: bool):
     """Background task: keep reading the graph queue and saving messages to DB
     after the SSE client has disconnected. Uses its own DB session."""
     try:
@@ -1005,6 +1290,7 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                 graph_task.cancel()
                 return
 
+            persisted_message_uids: set[str] = set()
             while True:
                 msg_type, payload = await queue.get()
 
@@ -1012,15 +1298,70 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     break
 
                 if msg_type == PROGRESS_EVENT:
-                    continue  # no SSE consumer — skip progress events
+                    event = DiscussionEvent(
+                        event_type="llm_progress",
+                        agent_name=payload.get("agent_name"),
+                        chars_received=payload.get("chars"),
+                        llm_status=payload.get("status"),
+                        phase=payload.get("phase", ""),
+                        content=payload.get("content"),
+                    )
+                    await _broadcast_discussion_event(discussion_id, event)
+                    continue
 
                 if msg_type == USER_MSG_CONSUMED:
+                    event = DiscussionEvent(
+                        event_type="user_message_consumed",
+                        agent_name=payload.get("agent_name", "用户"),
+                        content=payload.get("content", ""),
+                        phase="user_input",
+                    )
+                    await _broadcast_discussion_event(discussion_id, event)
+                    continue
+
+                if msg_type == NODE_MESSAGE_EVENT:
+                    msg_data = payload
+                    msg_uid = str(msg_data.get("message_uid") or "")
+                    if msg_uid and msg_uid in persisted_message_uids:
+                        continue
+
+                    msg = Message(
+                        discussion_id=discussion_id,
+                        agent_name=msg_data["agent_name"],
+                        agent_role=msg_data["agent_role"],
+                        content=msg_data["content"],
+                        round_number=msg_data.get("round_number", 0),
+                        cycle_index=msg_data.get("cycle_index", 0),
+                        phase=msg_data.get("phase", ""),
+                    )
+                    db.add(msg)
+                    await db.flush()
+                    if msg_uid:
+                        persisted_message_uids.add(msg_uid)
+                    await db.commit()
+
+                    if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
+                        asyncio.create_task(_summarize_message_bg(msg.id))
+                    event = DiscussionEvent(
+                        event_type="message",
+                        agent_name=msg_data["agent_name"],
+                        agent_role=msg_data["agent_role"],
+                        content=msg_data["content"],
+                        phase=msg_data.get("phase", ""),
+                        round_number=msg_data.get("round_number", 0),
+                        message_id=msg.id,
+                        cycle_index=msg_data.get("cycle_index", 0),
+                        created_at=msg.created_at,
+                    )
+                    await _broadcast_discussion_event(discussion_id, event)
                     continue
 
                 # GRAPH_EVENT
                 if "_error" in payload:
                     discussion.status = DiscussionStatus.FAILED
                     await db.commit()
+                    event = DiscussionEvent(event_type="error", content=payload["_error"])
+                    await _broadcast_discussion_event(discussion_id, event)
                     return
 
                 for node_name, node_output in payload.items():
@@ -1030,6 +1371,8 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     if error:
                         discussion.status = DiscussionStatus.FAILED
                         await db.commit()
+                        event = DiscussionEvent(event_type="error", content=error)
+                        await _broadcast_discussion_event(discussion_id, event)
                         return
 
                     if phase == "planning":
@@ -1040,9 +1383,23 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                         discussion.status = DiscussionStatus.REFLECTING
                     elif phase == "synthesizing":
                         discussion.status = DiscussionStatus.SYNTHESIZING
+                    elif phase == "round_summary":
+                        discussion.status = DiscussionStatus.REFLECTING
+                    elif phase == "next_step_planning":
+                        discussion.status = DiscussionStatus.PLANNING
 
                     saved_msgs = []
                     for msg_data in node_output.get("messages", []):
+                        msg_uid = str(msg_data.get("message_uid") or "")
+                        if msg_uid and msg_uid in persisted_message_uids:
+                            continue
+                        is_injected_user = (
+                            msg_data.get("agent_role") == AgentRole.USER
+                            and msg_data.get("phase") == "user_input"
+                        )
+                        if is_injected_user:
+                            continue
+
                         msg = Message(
                             discussion_id=discussion_id,
                             agent_name=msg_data["agent_name"],
@@ -1053,7 +1410,10 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                             phase=msg_data.get("phase", ""),
                         )
                         db.add(msg)
+                        await db.flush()
                         saved_msgs.append(msg)
+                        if msg_uid:
+                            persisted_message_uids.add(msg_uid)
 
                     if node_output.get("final_summary"):
                         discussion.final_summary = node_output["final_summary"]
@@ -1061,14 +1421,43 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     discussion.current_round = node_output.get("current_round", discussion.current_round)
                     await db.commit()
 
+                    for msg in saved_msgs:
+                        event = DiscussionEvent(
+                            event_type="message",
+                            agent_name=msg.agent_name,
+                            agent_role=msg.agent_role,
+                            content=msg.content,
+                            phase=msg.phase or "",
+                            round_number=msg.round_number,
+                            message_id=msg.id,
+                            cycle_index=msg.cycle_index,
+                            created_at=msg.created_at,
+                        )
+                        await _broadcast_discussion_event(discussion_id, event)
+                    if phase:
+                        event = DiscussionEvent(event_type="phase_change", phase=phase)
+                        await _broadcast_discussion_event(discussion_id, event)
+
                     # Fire background summarization
                     for msg in saved_msgs:
                         if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
                             asyncio.create_task(_summarize_message_bg(msg.id))
 
-            # Graph finished — set final status
-            discussion.status = DiscussionStatus.WAITING_INPUT
-            await db.commit()
+            # Graph finished — set final status (manual pause has highest priority).
+            manually_paused = discussion_id in _manual_pause_requests
+            if manually_paused:
+                _manual_pause_requests.discard(discussion_id)
+                discussion.status = DiscussionStatus.WAITING_INPUT
+                await db.commit()
+                event = DiscussionEvent(event_type="cycle_complete", content="讨论已暂停，可手动继续。")
+            else:
+                discussion.status = DiscussionStatus.WAITING_INPUT if single_round_mode else DiscussionStatus.COMPLETED
+                await db.commit()
+                if single_round_mode:
+                    event = DiscussionEvent(event_type="cycle_complete", content="增量轮次结束，等待您的下一次输入...")
+                else:
+                    event = DiscussionEvent(event_type="complete", content="已完成全部预设轮次，并生成最终完整总结。")
+            await _broadcast_discussion_event(discussion_id, event)
             logger.info("Drain task completed for discussion %d", discussion_id)
 
     except Exception as e:
@@ -1093,26 +1482,30 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
 
 
 async def stop_discussion(db: AsyncSession, discussion_id: int) -> bool:
-    """Cancel a running discussion: kill the graph task, drain task, and reset status."""
+    """Pause a discussion: cancel running tasks and move status to waiting_input."""
+    should_pause = False
     task = _running_tasks.pop(discussion_id, None)
     if task and not task.done():
+        should_pause = True
         task.cancel()
     drain = _drain_tasks.pop(discussion_id, None)
     if drain and not drain.done():
+        should_pause = True
         drain.cancel()
 
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
         return False
 
-    if discussion.status not in (
-        DiscussionStatus.COMPLETED,
-        DiscussionStatus.FAILED,
-        DiscussionStatus.CREATED,
-        DiscussionStatus.WAITING_INPUT,
-    ):
-        discussion.status = DiscussionStatus.FAILED
+    if discussion.status in RUNNING_DISCUSSION_STATUSES:
+        should_pause = True
+
+    if should_pause:
+        _manual_pause_requests.add(discussion_id)
+        discussion.status = DiscussionStatus.WAITING_INPUT
         await db.commit()
+    else:
+        _manual_pause_requests.discard(discussion_id)
     return True
 
 
@@ -1130,7 +1523,10 @@ async def summarize_discussion_messages(db: AsyncSession, discussion_id: int) ->
     """Batch-summarize unsummarized long messages, yielding SSE progress events."""
     result = await db.execute(
         select(Message)
-        .where(Message.discussion_id == discussion_id, Message.summary.is_(None))
+        .where(
+            Message.discussion_id == discussion_id,
+            or_(Message.summary.is_(None), Message.summary == ""),
+        )
         .order_by(Message.id)
     )
     all_msgs = [m for m in result.scalars().all() if len(m.content) >= MIN_SUMMARY_LENGTH]
@@ -1145,39 +1541,127 @@ async def summarize_discussion_messages(db: AsyncSession, discussion_id: int) ->
         return
 
     total = len(all_msgs)
-    for i, msg in enumerate(all_msgs):
-        yield DiscussionEvent(
-            event_type="summary_progress",
-            agent_name=msg.agent_name,
-            round_number=msg.id,
-            content=f"{i + 1}/{total}",
-        )
+    yield DiscussionEvent(event_type="summary_progress", content=f"0/{total}")
+
+    # Parallelize summary generation; cache results in memory and persist once at the end.
+    max_parallel = 3
+    semaphore = asyncio.Semaphore(max_parallel)
+    queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+    finished_lock = asyncio.Lock()
+    finished_count = 0
+    pending_summaries: dict[int, str] = {}
+
+    async def _worker(msg_obj: Message):
+        nonlocal finished_count
+        streamed_text = ""
+
+        async def on_chunk(delta: str, total_chars: int):
+            nonlocal streamed_text
+            streamed_text += delta
+            await queue.put((
+                "event",
+                DiscussionEvent(
+                    event_type="summary_chunk",
+                    agent_name=msg_obj.agent_name,
+                    message_id=msg_obj.id,
+                    chars_received=total_chars,
+                    content=streamed_text,
+                ),
+            ))
+
         try:
-            summary = await call_llm(
-                provider=cfg.get("provider", "openai"),
-                model=cfg.get("model", "gpt-4o-mini"),
-                messages=[{"role": "user", "content": f"请用2-3句话简洁总结以下内容，保留关键观点，不要添加额外评论：\n\n{msg.content}"}],
-                api_key=cfg.get("api_key"),
-                base_url=cfg.get("base_url"),
-                temperature=0.3,
-                max_tokens=200,
-            )
-            msg.summary = summary.strip()
-            await db.commit()
-            yield DiscussionEvent(
-                event_type="summary_done",
-                agent_name=msg.agent_name,
-                round_number=msg.id,
-                content=msg.summary,
-            )
+            async with semaphore:
+                summary, _ = await call_llm_stream(
+                    provider=cfg.get("provider", "openai"),
+                    model=cfg.get("model", "gpt-4o-mini"),
+                    messages=[{"role": "user", "content": f"请用2-3句话简洁总结以下内容，保留关键观点，不要添加额外评论：\n\n{msg_obj.content}"}],
+                    api_key=cfg.get("api_key"),
+                    base_url=cfg.get("base_url"),
+                    temperature=0.3,
+                    on_chunk=on_chunk,
+                )
+
+            normalized = (summary or "").strip()
+            if not normalized:
+                fallback = (msg_obj.content or "").strip()
+                if len(fallback) > 180:
+                    fallback = f"{fallback[:180]}..."
+                normalized = fallback or "（摘要为空）"
+                logger.warning("Summary model returned empty output for message %d; using fallback text", msg_obj.id)
+
+            await queue.put(("summary_ready", (msg_obj.id, normalized)))
+            await queue.put((
+                "event",
+                DiscussionEvent(
+                    event_type="summary_done",
+                    agent_name=msg_obj.agent_name,
+                    message_id=msg_obj.id,
+                    content=normalized,
+                ),
+            ))
         except Exception as e:
-            logger.warning("Failed to summarize message %d: %s", msg.id, e)
-            yield DiscussionEvent(
-                event_type="summary_error",
-                agent_name=msg.agent_name,
-                round_number=msg.id,
-                content=str(e),
-            )
+            logger.warning("Failed to summarize message %d: %s", msg_obj.id, e)
+            await queue.put((
+                "event",
+                DiscussionEvent(
+                    event_type="summary_error",
+                    agent_name=msg_obj.agent_name,
+                    message_id=msg_obj.id,
+                    content=str(e),
+                ),
+            ))
+        finally:
+            async with finished_lock:
+                finished_count += 1
+                current = finished_count
+            await queue.put((
+                "event",
+                DiscussionEvent(
+                    event_type="summary_progress",
+                    agent_name=msg_obj.agent_name,
+                    message_id=msg_obj.id,
+                    content=f"{current}/{total}",
+                ),
+            ))
+            await queue.put(("worker_done", msg_obj.id))
+
+    workers = [asyncio.create_task(_worker(m)) for m in all_msgs]
+
+    done_workers = 0
+    try:
+        while done_workers < total:
+            kind, payload = await queue.get()
+            if kind == "event":
+                yield payload  # type: ignore[misc]
+                continue
+            if kind == "summary_ready":
+                msg_id, summary_text = payload  # type: ignore[misc]
+                pending_summaries[msg_id] = summary_text
+                continue
+            if kind == "worker_done":
+                done_workers += 1
+                continue
+    finally:
+        for w in workers:
+            if not w.done():
+                w.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    if pending_summaries:
+        try:
+            for msg_id, summary_text in pending_summaries.items():
+                await db.execute(
+                    update(Message)
+                    .where(Message.id == msg_id, Message.discussion_id == discussion_id)
+                    .values(summary=summary_text)
+                )
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.warning("Failed to persist summary batch for discussion %d: %s", discussion_id, e)
+            yield DiscussionEvent(event_type="error", content=f"总结落库失败: {str(e)}")
+            return
 
     yield DiscussionEvent(event_type="summary_complete", content="总结完成")
 
@@ -1186,26 +1670,29 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
     """Submit a user message into a running discussion.
 
     The message is saved to DB immediately and queued for injection
-    into the next host_planning_node round.
+    into the end-of-round next-step planning node.
     """
     discussion = await get_discussion(db, discussion_id)
     if discussion:
         existing_cycle = max((getattr(m, "cycle_index", 0) for m in discussion.messages), default=-1)
+        round_number = discussion.current_round or 0
         if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED):
             cycle_index = existing_cycle + 1
+            round_number = 0
         elif existing_cycle >= 0:
             cycle_index = existing_cycle
         else:
             cycle_index = 0
     else:
         cycle_index = 0
+        round_number = 0
 
     msg = Message(
         discussion_id=discussion_id,
         agent_name="用户",
         agent_role=AgentRole.USER,
         content=content,
-        round_number=0,
+        round_number=round_number,
         cycle_index=cycle_index,
         phase="user_input",
     )
@@ -1217,6 +1704,7 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
     _pending_user_messages.setdefault(discussion_id, []).append({
         "agent_name": "用户",
         "content": content,
+        "round_number": round_number,
         "cycle_index": cycle_index,
     })
 

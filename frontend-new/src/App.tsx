@@ -3,10 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import rehypeRaw from 'rehype-raw';
 import rehypeHighlight from 'rehype-highlight';
 import {
   PlusCircle,
@@ -36,12 +35,14 @@ import {
   Loader2,
   FileText,
   Download,
+  Pencil,
+  Check,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, MessageResponse, AgentConfigResponse, LLMProviderResponse, ObserverMessageResponse } from './types';
+import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, SummaryEvent, MessageResponse, AgentConfigResponse, LLMProviderResponse, ObserverMessageResponse } from './types';
 import {
   listDiscussions, getDiscussion, deleteDiscussion, stopDiscussion, resetDiscussion,
-  prepareAgents, generateTitle, submitUserInput, deleteMessage, updateMessage,
+  prepareAgents, generateTitle, submitUserInput, deleteMessage, updateMessage, updateTopic,
   streamDiscussion, streamSummarize, streamObserverChat,
   listLLMProviders, getObserverHistory, clearObserverHistory,
 } from './services/api';
@@ -52,10 +53,25 @@ import { ModelAvatar } from './components/ModelAvatar';
 import 'highlight.js/styles/github-dark.css';
 
 const PHASE_LABELS: Record<string, string> = {
-  planning: 'Planning', discussing: 'Discussing', reflecting: 'Reflecting', synthesizing: 'Synthesizing',
+  planning: '规划中',
+  discussing: '讨论中',
+  reflecting: '反思中',
+  synthesizing: '总结中',
+  round_summary: '轮次总结中',
+  next_step_planning: '下一步规划中',
 };
 
 const RUNNING_STATUSES = ['planning', 'discussing', 'reflecting', 'synthesizing'];
+
+function roleOwnsPhase(role: string, phase: string) {
+  if (!phase) return false;
+  if (phase === 'planning' || phase === 'round_summary' || phase === 'synthesizing' || phase === 'next_step_planning') {
+    return role === 'host';
+  }
+  if (phase === 'discussing') return role === 'panelist';
+  if (phase === 'reflecting') return role === 'critic';
+  return false;
+}
 
 function formatTime(ts: string) {
   const s = String(ts);
@@ -73,28 +89,253 @@ function statusLabel(s: string) {
   return s;
 }
 
-const MarkdownRenderer = ({ content }: { content: string }) => {
+function normalizeMarkdown(content: string) {
+  const lines = String(content || '').replace(/\r/g, '').split('\n');
+  const normalized: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+      .replace(/^(\s*)(\d+)[、）]\s+/, '$1$2. ')
+      .replace(/^(\s*)[•●·]\s+/, '$1- ');
+    const isList = /^\s*([-*+]\s+|\d+[.)]\s+)/.test(line);
+    const prev = normalized.length ? normalized[normalized.length - 1] : '';
+    if (isList && prev && prev.trim() && !/^\s*([-*+]\s+|\d+[.)]\s+)/.test(prev)) {
+      normalized.push('');
+    }
+    normalized.push(line);
+  }
+  return normalized.join('\n');
+}
+
+let mermaidScriptPromise: Promise<void> | null = null;
+let mathJaxScriptPromise: Promise<void> | null = null;
+let mermaidInitialized = false;
+
+function loadScriptOnce(src: string, checkLoaded: () => boolean) {
+  if (checkLoaded()) return Promise.resolve();
+  const existing = Array.from(document.getElementsByTagName('script')).find(s => s.src === src);
+  if (existing) {
+    return new Promise<void>((resolve, reject) => {
+      if (checkLoaded()) {
+        resolve();
+        return;
+      }
+      existing.addEventListener('load', () => resolve(), { once: true });
+      existing.addEventListener('error', () => reject(new Error(`Failed to load script: ${src}`)), { once: true });
+    });
+  }
+  return new Promise<void>((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+async function ensureMermaidLoaded() {
+  if (!mermaidScriptPromise) {
+    mermaidScriptPromise = loadScriptOnce(
+      'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js',
+      () => typeof (window as any).mermaid !== 'undefined',
+    );
+  }
+  await mermaidScriptPromise;
+  const mermaid = (window as any).mermaid;
+  if (mermaid && !mermaidInitialized) {
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
+    });
+    mermaidInitialized = true;
+  }
+}
+
+async function ensureMathJaxLoaded() {
+  if (!mathJaxScriptPromise) {
+    (window as any).MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+      },
+      svg: { fontCache: 'global' },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false },
+    };
+    mathJaxScriptPromise = loadScriptOnce(
+      'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js',
+      () => typeof (window as any).MathJax?.typesetPromise === 'function',
+    );
+  }
+  await mathJaxScriptPromise;
+}
+
+function MermaidBlock({ code }: { code: string }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const renderMermaid = async () => {
+      try {
+        setError(null);
+        await ensureMermaidLoaded();
+        const mermaid = (window as any).mermaid;
+        if (!mermaid) throw new Error('Mermaid is unavailable');
+        const id = `mermaid-${Math.random().toString(36).slice(2)}`;
+        const { svg } = await mermaid.render(id, code);
+        if (!cancelled && ref.current) {
+          ref.current.innerHTML = svg;
+        }
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || 'Failed to render mermaid');
+      }
+    };
+    renderMermaid();
+    return () => { cancelled = true; };
+  }, [code]);
+
+  if (error) {
+    return (
+      <div className="rounded-lg border border-red-300 bg-red-50 dark:border-red-800/50 dark:bg-red-900/20 p-3 text-xs text-red-700 dark:text-red-300">
+        Mermaid render error: {error}
+      </div>
+    );
+  }
+  return <div ref={ref} className="my-3 overflow-x-auto mermaid-block" />;
+}
+
+type LiveState = {
+  phase: string;
+  llmProgress: Record<string, { chars: number; status: string; phase?: string }>;
+  streamingContent: Record<string, string>;
+  updatedAt: number;
+};
+
+function liveStateKey(id: number) {
+  return `rt_live_state_${id}`;
+}
+
+function readLiveState(id: number): LiveState | null {
+  try {
+    const raw = sessionStorage.getItem(liveStateKey(id));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      phase: String(parsed.phase || ''),
+      llmProgress: (parsed.llmProgress || {}) as LiveState['llmProgress'],
+      streamingContent: (parsed.streamingContent || {}) as Record<string, string>,
+      updatedAt: Number(parsed.updatedAt || 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeLiveState(id: number, state: LiveState) {
+  try {
+    sessionStorage.setItem(liveStateKey(id), JSON.stringify(state));
+  } catch {
+    // Ignore storage quota/security errors.
+  }
+}
+
+function clearLiveState(id: number) {
+  try {
+    sessionStorage.removeItem(liveStateKey(id));
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+const MarkdownRendererBase = ({ content }: { content: string }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const typesetMath = async () => {
+      try {
+        await ensureMathJaxLoaded();
+        if (cancelled || !containerRef.current) return;
+        const mathJax = (window as any).MathJax;
+        if (mathJax?.typesetPromise) {
+          await mathJax.typesetPromise([containerRef.current]);
+        }
+      } catch {
+        // Keep raw markdown if math engine cannot be loaded.
+      }
+    };
+    typesetMath();
+    return () => { cancelled = true; };
+  }, [content]);
+
   return (
-    <div className="prose dark:prose-invert prose-slate prose-sm prose-h1:text-3xl prose-h2:text-2xl prose-h3:text-xl max-w-none leading-relaxed 
-        prose-headings:font-bold prose-headings:text-slate-800 dark:prose-headings:text-slate-100
-        prose-a:text-violet-600 dark:prose-a:text-violet-400 prose-a:no-underline hover:prose-a:underline
-        prose-strong:font-bold prose-strong:text-slate-900 dark:prose-strong:text-white
-        prose-code:text-violet-600 dark:prose-code:text-violet-300 prose-code:bg-slate-200 dark:prose-code:bg-slate-700 prose-code:px-1 prose-code:py-0.5 prose-code:rounded prose-code:before:content-none prose-code:after:content-none
-        prose-pre:bg-slate-900 dark:prose-pre:bg-slate-950 prose-pre:text-slate-50 prose-pre:rounded-xl prose-pre:p-4
-        prose-blockquote:border-l-4 prose-blockquote:border-violet-500 prose-blockquote:bg-slate-50 dark:prose-blockquote:bg-slate-900/50 prose-blockquote:py-2 prose-blockquote:px-4 prose-blockquote:rounded-r-lg prose-blockquote:not-italic
-        prose-ul:list-disc prose-ul:pl-5 prose-ol:list-decimal prose-ol:pl-5
-        prose-li:marker:text-slate-400">
+    <div ref={containerRef} className="markdown-body">
       <ReactMarkdown 
         remarkPlugins={[remarkGfm]} 
-        rehypePlugins={[rehypeRaw, rehypeHighlight]}
+        rehypePlugins={[rehypeHighlight]}
+        components={{
+          h1: ({ node, ...props }) => <h1 className="md-title md-title-1" {...props} />,
+          h2: ({ node, ...props }) => <h2 className="md-title md-title-2" {...props} />,
+          h3: ({ node, ...props }) => <h3 className="md-title md-title-3" {...props} />,
+          h4: ({ node, ...props }) => <h4 className="md-title md-title-4" {...props} />,
+          h5: ({ node, ...props }) => <h5 className="md-title md-title-5" {...props} />,
+          h6: ({ node, ...props }) => <h6 className="md-title md-title-6" {...props} />,
+          ul: ({ node, ...props }) => <ul className="md-list md-list-ul" {...props} />,
+          ol: ({ node, ...props }) => <ol className="md-list md-list-ol" {...props} />,
+          li: ({ node, ...props }) => <li className="md-list-item" {...props} />,
+          p: ({ node, ...props }) => <p className="md-paragraph" {...props} />,
+          blockquote: ({ node, ...props }) => <blockquote className="md-quote" {...props} />,
+          hr: ({ node, ...props }) => <hr className="md-hr" {...props} />,
+          table: ({ node, ...props }) => <div className="md-table-wrap"><table className="md-table" {...props} /></div>,
+          th: ({ node, ...props }) => <th className="md-th" {...props} />,
+          td: ({ node, ...props }) => <td className="md-td" {...props} />,
+          pre: ({ node, ...props }) => <pre className="md-pre" {...props} />,
+          a: ({ node, ...props }) => <a className="md-link" target="_blank" rel="noreferrer" {...props} />,
+          code: ({ node, className, children, ...props }: any) => {
+            const inline = !className || !/language-/.test(className);
+            if (inline) return <code className="md-inline-code" {...props}>{children}</code>;
+            const language = /language-(\w+)/.exec(className || '')?.[1]?.toLowerCase();
+            const raw = String(children || '').replace(/\n$/, '');
+            if (language === 'mermaid') {
+              return <MermaidBlock code={raw} />;
+            }
+            return <code className={className} {...props}>{children}</code>;
+          },
+        }}
       >
-        {content}
+        {normalizeMarkdown(content)}
       </ReactMarkdown>
     </div>
   );
 };
 
+const MarkdownRenderer = React.memo(
+  MarkdownRendererBase,
+  (prev, next) => prev.content === next.content,
+);
+MarkdownRenderer.displayName = 'MarkdownRenderer';
+
 const SummaryModal = ({ isOpen, onClose, content, title, onDownload }: { isOpen: boolean; onClose: () => void; content: string; title: string; onDownload?: () => void }) => {
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1200);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(content || '');
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable in some browsers/contexts.
+    }
+  }, [content]);
+
   if (!isOpen) return null;
 
   return (
@@ -114,7 +355,19 @@ const SummaryModal = ({ isOpen, onClose, content, title, onDownload }: { isOpen:
             <BarChart3 className="w-5 h-5 text-violet-500" />
             {title}
           </h3>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={handleCopy}
+              className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors relative"
+              title="Copy"
+            >
+              <Copy className="w-4 h-4 text-slate-500" />
+              {copied && (
+                <span className="absolute -bottom-6 right-0 text-[10px] text-emerald-600 dark:text-emerald-400 whitespace-nowrap">
+                  已复制
+                </span>
+              )}
+            </button>
             {onDownload && (
               <button onClick={onDownload} className="p-1.5 hover:bg-slate-200 dark:hover:bg-slate-700 rounded-full transition-colors" title="Download">
                 <Download className="w-4 h-4 text-slate-500" />
@@ -145,22 +398,30 @@ export default function App() {
   const [phase, setPhase] = useState('');
   const [discStatus, setDiscStatus] = useState<string>('loading');
   const [error, setError] = useState<string | null>(null);
-  const [llmProgress, setLlmProgress] = useState<Record<string, { chars: number; status: string }> | null>(null);
+  const [llmProgress, setLlmProgress] = useState<Record<string, { chars: number; status: string; phase?: string }> | null>(null);
+  const [streamingContent, setStreamingContent] = useState<Record<string, string>>({});
   const [preparingAgents, setPreparingAgents] = useState(false);
 
   // UI state
   const [inputText, setInputText] = useState('');
   const [sendingInput, setSendingInput] = useState(false);
   const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
-  const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(true);
+  const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(false);
   const [summaryModalOpen, setSummaryModalOpen] = useState(false);
   const [summaryContent, setSummaryContent] = useState('');
   const [summaryTitle, setSummaryTitle] = useState('');
   const [summaryDownloadUrl, setSummaryDownloadUrl] = useState('');
+  const [summarizing, setSummarizing] = useState(false);
+  const [summaryProgress, setSummaryProgress] = useState('');
+  const [summarizingMsgId, setSummarizingMsgId] = useState<number | null>(null);
+  const [streamingSummaries, setStreamingSummaries] = useState<Record<number, string>>({});
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newDebateOpen, setNewDebateOpen] = useState(false);
   const [showAgents, setShowAgents] = useState(false);
   const [showHeaderMenu, setShowHeaderMenu] = useState(false);
+  const [editingMsgIdx, setEditingMsgIdx] = useState<number | null>(null);
+  const [editingContent, setEditingContent] = useState('');
+
   const [editingAgent, setEditingAgent] = useState<AgentConfigResponse | null>(null);
   const [rightSidebarWidth, setRightSidebarWidth] = useState(340);
   const [isResizing, setIsResizing] = useState(false);
@@ -177,8 +438,37 @@ export default function App() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const observerScrollRef = useRef<HTMLDivElement>(null);
+  const isMainNearBottomRef = useRef(true);
+  const isObserverNearBottomRef = useRef(true);
+  const liveStateRef = useRef<Record<number, LiveState>>({});
   const streamRef = useRef<AbortController | null>(null);
+  const summaryStreamRef = useRef<AbortController | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const summarizeAutoRef = useRef(false);
+  const summarizeAutoBlockUntilRef = useRef(0);
+  const summarizeRunningCooldownRef = useRef(0);
+
+  const persistLiveState = useCallback((id: number, patch: Partial<LiveState>) => {
+    const prev = liveStateRef.current[id] || {
+      phase: '',
+      llmProgress: {},
+      streamingContent: {},
+      updatedAt: Date.now(),
+    };
+    const next: LiveState = {
+      phase: patch.phase ?? prev.phase,
+      llmProgress: patch.llmProgress ?? prev.llmProgress,
+      streamingContent: patch.streamingContent ?? prev.streamingContent,
+      updatedAt: Date.now(),
+    };
+    liveStateRef.current[id] = next;
+    writeLiveState(id, next);
+  }, []);
+
+  const removeLiveState = useCallback((id: number) => {
+    delete liveStateRef.current[id];
+    clearLiveState(id);
+  }, []);
 
   // Resize handler for observer panel
   useEffect(() => {
@@ -202,18 +492,39 @@ export default function App() {
 
   // Load providers
   useEffect(() => {
-    listLLMProviders().then(p => {
-      setProviders(p);
-      if (p.length && !observerConfig.provider) {
-        const first = p[0];
-        setObserverConfig({ providerId: first.id, provider: first.provider, model: first.models[0]?.model || '' });
-      }
-    }).catch(() => {});
+    listLLMProviders().then(setProviders).catch(() => {});
   }, []);
 
-  // Auto-scroll messages
-  useEffect(() => { scrollRef.current && (scrollRef.current.scrollTop = scrollRef.current.scrollHeight); }, [messages]);
-  useEffect(() => { observerScrollRef.current && (observerScrollRef.current.scrollTop = observerScrollRef.current.scrollHeight); }, [observerMessages, observerStreamText]);
+  // Keep observer config consistent with latest provider list.
+  useEffect(() => {
+    if (!providers.length) return;
+    const selected = providers.find(p => p.id === observerConfig.providerId);
+    if (!selected) {
+      const first = providers[0];
+      setObserverConfig({ providerId: first.id, provider: first.provider, model: first.models[0]?.model || '' });
+      return;
+    }
+    const hasModel = selected.models.some(m => m.model === observerConfig.model);
+    if (!observerConfig.provider || observerConfig.provider !== selected.provider || !observerConfig.model || !hasModel) {
+      setObserverConfig({
+        providerId: selected.id,
+        provider: selected.provider,
+        model: selected.models[0]?.model || '',
+      });
+    }
+  }, [providers, observerConfig.providerId, observerConfig.provider, observerConfig.model]);
+
+  // Auto-scroll only when user is already near the bottom.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !isMainNearBottomRef.current) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [messages, streamingContent, streamingSummaries]);
+  useEffect(() => {
+    const el = observerScrollRef.current;
+    if (!el || !isObserverNearBottomRef.current) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [observerMessages, observerStreamText]);
 
   // Polling for already-running discussions
   const startPolling = useCallback(() => {
@@ -223,27 +534,52 @@ export default function App() {
         const d = await getDiscussion(activeId);
         setMessages(d.messages || []);
         setPhase(d.status);
+        persistLiveState(activeId, { phase: d.status });
         setAgents(d.agents || []);
         if (!RUNNING_STATUSES.includes(d.status)) {
           clearInterval(pollRef.current!);
           pollRef.current = null;
+          removeLiveState(activeId);
           setDiscStatus(d.status === 'waiting_input' ? 'waiting_input' : d.status === 'completed' ? 'completed' : 'error');
         }
       } catch {}
     }, 2500);
-  }, [activeId]);
+  }, [activeId, persistLiveState, removeLiveState]);
 
   // Load discussion detail when activeId changes
   useEffect(() => {
     streamRef.current?.abort();
+    streamRef.current = null;
+    summaryStreamRef.current?.abort();
+    summaryStreamRef.current = null;
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     observerStreamRef.current?.abort();
-    if (!activeId) { setDetail(null); setMessages([]); setAgents([]); setDiscStatus('loading'); return; }
+    isMainNearBottomRef.current = true;
+    isObserverNearBottomRef.current = true;
+    summarizeAutoRef.current = false;
+    setSummarizing(false);
+    setSummaryProgress('');
+    setSummarizingMsgId(null);
+    setStreamingSummaries({});
+    if (!activeId) {
+      setDetail(null);
+      setMessages([]);
+      setAgents([]);
+      setDiscStatus('loading');
+      setStreamingContent({});
+      setLlmProgress(null);
+      return;
+    }
 
     const load = async () => {
       setDiscStatus('loading');
       setError(null);
       setLlmProgress(null);
+      setStreamingContent({});
+      setSummarizing(false);
+      setSummaryProgress('');
+      setSummarizingMsgId(null);
+      setStreamingSummaries({});
       setPhase('');
       try {
         const [d, obsHistory] = await Promise.all([
@@ -255,11 +591,22 @@ export default function App() {
         setAgents(d.agents || []);
         setObserverMessages(obsHistory as ObserverMessageResponse[]);
 
-        if (d.status === 'completed') setDiscStatus('completed');
-        else if (d.status === 'waiting_input') setDiscStatus('waiting_input');
-        else if (d.status === 'failed') { setDiscStatus('error'); setError('Discussion failed'); }
+        if (d.status === 'completed') {
+          setDiscStatus('completed');
+          removeLiveState(activeId);
+        }
+        else if (d.status === 'waiting_input') {
+          setDiscStatus('waiting_input');
+          removeLiveState(activeId);
+        }
+        else if (d.status === 'failed') {
+          setDiscStatus('error');
+          setError('Discussion failed');
+          removeLiveState(activeId);
+        }
         else if (d.status === 'created') {
           setDiscStatus('ready');
+          removeLiveState(activeId);
           if (!d.agents?.length) {
             setPreparingAgents(true);
             try {
@@ -269,6 +616,13 @@ export default function App() {
           }
         } else if (RUNNING_STATUSES.includes(d.status)) {
           setDiscStatus('running');
+          const cached = liveStateRef.current[activeId] || readLiveState(activeId);
+          if (cached) {
+            liveStateRef.current[activeId] = cached;
+            if (cached.phase) setPhase(cached.phase);
+            if (Object.keys(cached.llmProgress).length) setLlmProgress(cached.llmProgress);
+            if (Object.keys(cached.streamingContent).length) setStreamingContent(cached.streamingContent);
+          }
           startPolling();
         }
       } catch (e: unknown) {
@@ -277,50 +631,127 @@ export default function App() {
       }
     };
     load();
-    return () => { streamRef.current?.abort(); if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; } };
-  }, [activeId, startPolling]);
+    return () => {
+      streamRef.current?.abort();
+      streamRef.current = null;
+      summaryStreamRef.current?.abort();
+      summaryStreamRef.current = null;
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    };
+  }, [activeId, startPolling, removeLiveState]);
 
   // --- Handlers ---
 
   const startDiscussionStream = useCallback(async () => {
     if (!activeId) return;
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
+    }
     setDiscStatus('running');
     setError(null);
     const controller = streamDiscussion(
       activeId,
       (event: DiscussionEvent) => {
-        if (event.event_type === 'phase_change') setPhase(event.phase || '');
+        if (event.event_type === 'phase_change') {
+          const nextPhase = event.phase || '';
+          setPhase(nextPhase);
+          persistLiveState(activeId, { phase: nextPhase });
+          setLlmProgress(prev => {
+            if (!prev) return prev;
+            const next: Record<string, { chars: number; status: string; phase?: string }> = {};
+            for (const [name, entry] of Object.entries(prev)) {
+              const agent = agents.find(a => a.name === name);
+              if (!agent) continue;
+              if (roleOwnsPhase(agent.role, nextPhase)) {
+                next[name] = { ...entry, phase: nextPhase };
+              }
+            }
+            persistLiveState(activeId, { llmProgress: next });
+            return Object.keys(next).length ? next : null;
+          });
+          setStreamingContent(prev => {
+            const next: Record<string, string> = {};
+            for (const [name, content] of Object.entries(prev)) {
+              const agent = agents.find(a => a.name === name);
+              if (agent && roleOwnsPhase(agent.role, nextPhase)) {
+                next[name] = content;
+              }
+            }
+            persistLiveState(activeId, { streamingContent: next });
+            return next;
+          });
+        }
         if (event.event_type === 'message') {
-          setMessages(prev => [...prev, event as unknown as MessageResponse]);
+          const roleRaw = String(event.agent_role || 'panelist').toLowerCase();
+          const normalizedRole: MessageResponse['agent_role'] =
+            roleRaw === 'host' || roleRaw === 'panelist' || roleRaw === 'critic' || roleRaw === 'user'
+              ? roleRaw
+              : 'panelist';
+          const normalizedMessage: MessageResponse = {
+            id: event.message_id ?? Date.now(),
+            agent_name: event.agent_name || '',
+            agent_role: normalizedRole,
+            content: event.content || '',
+            summary: null,
+            round_number: event.round_number ?? 0,
+            cycle_index: event.cycle_index ?? 0,
+            phase: event.phase ?? null,
+            created_at: event.created_at || new Date().toISOString(),
+          };
+          setMessages(prev => [...prev, normalizedMessage]);
           if (event.agent_name) {
             setLlmProgress(prev => {
               if (!prev) return prev;
               const next = { ...prev };
               delete next[event.agent_name!];
+              persistLiveState(activeId, { llmProgress: next });
               return Object.keys(next).length ? next : null;
+            });
+            setStreamingContent(prev => {
+              const next = { ...prev };
+              delete next[event.agent_name!];
+              persistLiveState(activeId, { streamingContent: next });
+              return next;
             });
           }
         }
         if (event.event_type === 'llm_progress') {
-          setLlmProgress(prev => ({
-            ...prev,
-            [event.agent_name!]: { chars: event.chars_received || 0, status: event.llm_status || '' },
-          }));
-          if (event.llm_status === 'done') {
-            setTimeout(() => {
-              setLlmProgress(prev => {
-                if (!prev) return prev;
-                const next = { ...prev };
-                delete next[event.agent_name!];
-                return Object.keys(next).length ? next : null;
-              });
-            }, 800);
+          setLlmProgress(prev => {
+            const prevEntry = prev?.[event.agent_name!];
+            const next = {
+              ...prev,
+              [event.agent_name!]: {
+                chars: event.chars_received || 0,
+                status: event.llm_status || '',
+                phase: event.phase || prevEntry?.phase || phase,
+              },
+            };
+            persistLiveState(activeId, { llmProgress: next });
+            return next;
+          });
+          if (event.content && event.phase !== 'round_summary') {
+            setStreamingContent(prev => {
+              const next = { ...prev, [event.agent_name!]: event.content! };
+              persistLiveState(activeId, { streamingContent: next });
+              return next;
+            });
           }
         }
       },
-      (errMsg) => { setDiscStatus('error'); setError(errMsg); },
+      (errMsg) => {
+        setDiscStatus('error');
+        setError(errMsg);
+        setLlmProgress(null);
+        setStreamingContent({});
+        streamRef.current = null;
+        removeLiveState(activeId);
+      },
       (evt: DiscussionEvent) => {
         setLlmProgress(null);
+        setStreamingContent({});
+        streamRef.current = null;
+        removeLiveState(activeId);
         getDiscussion(activeId).then(d => {
           setDetail(d);
           setMessages(d.messages || []);
@@ -331,44 +762,82 @@ export default function App() {
       },
     );
     streamRef.current = controller;
-  }, [activeId, refreshList]);
+  }, [activeId, phase, persistLiveState, removeLiveState, refreshList]);
+
+  // Auto-reattach live stream for running discussions (supports tab switch / refresh recovery).
+  useEffect(() => {
+    if (!activeId || discStatus !== 'running') return;
+    if (streamRef.current) return;
+    startDiscussionStream();
+  }, [activeId, discStatus, startDiscussionStream]);
 
   const handleStop = useCallback(async () => {
     streamRef.current?.abort();
+    streamRef.current = null;
+    summaryStreamRef.current?.abort();
+    summaryStreamRef.current = null;
     if (activeId) try { await stopDiscussion(activeId); } catch {}
     setLlmProgress(null);
-    setDiscStatus('completed');
+    setStreamingContent({});
+    setSummarizing(false);
+    setSummaryProgress('');
+    setSummarizingMsgId(null);
+    setStreamingSummaries({});
+    setDiscStatus('waiting_input');
     setPhase('');
+    if (activeId) removeLiveState(activeId);
     refreshList();
-  }, [activeId, refreshList]);
+  }, [activeId, refreshList, removeLiveState]);
+
+  const handleResume = useCallback(() => {
+    if (!activeId || discStatus === 'running') return;
+    setError(null);
+    startDiscussionStream();
+  }, [activeId, discStatus, startDiscussionStream]);
 
   const handleReset = useCallback(async () => {
     streamRef.current?.abort();
+    streamRef.current = null;
+    summaryStreamRef.current?.abort();
+    summaryStreamRef.current = null;
     if (activeId) try { await resetDiscussion(activeId); } catch {}
     setMessages([]);
     setLlmProgress(null);
+    setStreamingContent({});
+    setSummarizing(false);
+    setSummaryProgress('');
+    setSummarizingMsgId(null);
+    setStreamingSummaries({});
     setPhase('');
     setError(null);
     setDiscStatus('ready');
+    if (activeId) removeLiveState(activeId);
     if (activeId) {
       setPreparingAgents(true);
       try { setAgents(await prepareAgents(activeId)); } catch {} finally { setPreparingAgents(false); }
     }
-  }, [activeId]);
+  }, [activeId, removeLiveState]);
 
   const handleUserInput = useCallback(async () => {
     const text = inputText.trim();
     if (!text || sendingInput || !activeId) return;
+    const tempId = Date.now();
     setSendingInput(true);
     setMessages(prev => [...prev, {
-      id: Date.now(), agent_name: 'User', agent_role: 'user', content: text,
+      id: tempId, agent_name: 'User', agent_role: 'user', content: text,
       summary: null, round_number: 0, cycle_index: 0, phase: 'user_input', created_at: new Date().toISOString(),
     } as MessageResponse]);
     setInputText('');
     try {
-      await submitUserInput(activeId, text);
+      const saved = await submitUserInput(activeId, text);
+      if (saved?.id) {
+        setMessages(prev => prev.map(m => (
+          m.id === tempId ? { ...m, id: saved.id, content: saved.content || text } : m
+        )));
+      }
       if (discStatus !== 'running') { setSendingInput(false); startDiscussionStream(); return; }
     } catch (e: unknown) {
+      setMessages(prev => prev.filter(m => m.id !== tempId));
       setError(e instanceof Error ? e.message : 'Send failed');
     } finally { setSendingInput(false); }
   }, [activeId, inputText, sendingInput, discStatus, startDiscussionStream]);
@@ -385,19 +854,102 @@ export default function App() {
     setSummaryContent(content); setSummaryTitle(title); setSummaryDownloadUrl(downloadUrl); setSummaryModalOpen(true);
   };
 
+  const handleSummarize = useCallback(async () => {
+    if (!activeId || summarizing) return;
+    setSummarizing(true);
+    setSummaryProgress('');
+    setSummarizingMsgId(null);
+    setStreamingSummaries({});
+    await new Promise<void>((resolve) => {
+      const controller = streamSummarize(
+        activeId,
+        (evtRaw) => {
+          const event = evtRaw as SummaryEvent & { round_number?: number; event_type: string };
+          const msgId = Number(event.message_id ?? event.round_number ?? 0) || null;
+          if (event.event_type === 'summary_progress') {
+            const nextProgress = String(event.content || '');
+            setSummaryProgress(prev => (prev === nextProgress ? prev : nextProgress));
+            setSummarizingMsgId(prev => (prev === msgId ? prev : msgId));
+            return;
+          }
+          if (event.event_type === 'summary_chunk') {
+            if (!msgId) return;
+            setSummarizingMsgId(prev => (prev === msgId ? prev : msgId));
+            setStreamingSummaries(prev => {
+              const nextContent = event.content || '';
+              if (prev[msgId] === nextContent) return prev;
+              return { ...prev, [msgId]: nextContent };
+            });
+            return;
+          }
+          if (event.event_type === 'summary_done') {
+            if (!msgId) return;
+            setMessages(prev => prev.map(m => (m.id === msgId ? { ...m, summary: event.content || '' } : m)));
+            setStreamingSummaries(prev => {
+              const next = { ...prev };
+              delete next[msgId];
+              return next;
+            });
+            setSummarizingMsgId(null);
+            return;
+          }
+          if (event.event_type === 'summary_error') {
+            setError(event.content || 'Summary failed');
+          }
+        },
+        (err) => {
+          setError(err || 'Summary failed');
+          summarizeAutoBlockUntilRef.current = Date.now() + 10_000;
+          setSummarizing(false);
+          setSummaryProgress('');
+          setSummarizingMsgId(null);
+          setStreamingSummaries({});
+          summaryStreamRef.current = null;
+          resolve();
+        },
+        () => {
+          setSummarizing(false);
+          setSummaryProgress('');
+          setSummarizingMsgId(null);
+          setStreamingSummaries({});
+          summaryStreamRef.current = null;
+          resolve();
+        },
+      );
+      summaryStreamRef.current = controller;
+    });
+  }, [activeId, summarizing]);
+
   // Observer chat
   const handleObserverSend = useCallback(async () => {
     const text = observerInput.trim();
-    if (!text || observerStreaming || !observerConfig.provider || !activeId) return;
+    if (!text || observerStreaming) return;
+    if (!activeId) {
+      setError('No active discussion selected for observer chat');
+      return;
+    }
+    const selected = providers.find(p => p.id === observerConfig.providerId);
+    const resolvedProvider = observerConfig.provider || selected?.provider || '';
+    const resolvedModel = observerConfig.model || selected?.models[0]?.model || '';
+    const resolvedProviderId = observerConfig.providerId ?? selected?.id ?? null;
+    if (!resolvedProvider || !resolvedModel) {
+      setError('Observer model is not configured. Please choose a provider/model first.');
+      return;
+    }
     const userMsg: ObserverMessageResponse = { id: Date.now(), role: 'user', content: text, created_at: new Date().toISOString() };
     setObserverMessages(prev => [...prev, userMsg]);
     setObserverInput('');
     setObserverStreaming(true);
     setObserverStreamText('');
+    setObserverConfig(prev => ({
+      providerId: resolvedProviderId,
+      provider: resolvedProvider,
+      model: resolvedModel,
+    }));
     observerTextRef.current = '';
     const ctrl = streamObserverChat(
       activeId,
-      { content: text, provider: observerConfig.provider, model: observerConfig.model, provider_id: observerConfig.providerId ?? undefined },
+      { content: text, provider: resolvedProvider, model: resolvedModel, provider_id: resolvedProviderId ?? undefined },
       (chunk) => { observerTextRef.current += chunk; setObserverStreamText(prev => prev + chunk); },
       (err) => { setObserverStreamText(prev => prev + `\n[Error: ${err}]`); setObserverStreaming(false); },
       () => {
@@ -408,7 +960,7 @@ export default function App() {
       },
     );
     observerStreamRef.current = ctrl;
-  }, [activeId, observerInput, observerStreaming, observerConfig]);
+  }, [activeId, observerInput, observerStreaming, observerConfig, providers]);
 
   const handleObserverClear = useCallback(async () => {
     if (observerStreaming) { observerStreamRef.current?.abort(); setObserverStreaming(false); setObserverStreamText(''); }
@@ -418,9 +970,77 @@ export default function App() {
 
   const selectedProviderObj = providers.find(p => p.id === observerConfig.providerId);
   const observerModels = selectedProviderObj?.models || [];
+  const displayMessages = useMemo(() => {
+    if (detail?.topic && (!messages.length || messages[0]?.agent_role !== 'user')) {
+      return [{ id: null, agent_name: '用户', agent_role: 'user', content: detail.topic, phase: 'user_input', created_at: detail.created_at, round_number: 0 } as unknown as MessageResponse, ...messages];
+    }
+    return messages;
+  }, [messages, detail]);
+  const unsummarizedCount = messages.filter(m => (m.content || '').length >= 200 && !m.summary).length;
+
+  useEffect(() => {
+    if (!activeId) return;
+    if (!(discStatus === 'running' || discStatus === 'completed' || discStatus === 'waiting_input')) return;
+    if (unsummarizedCount <= 0) return;
+    if (Date.now() < summarizeAutoBlockUntilRef.current) return;
+    if (discStatus === 'running') {
+      const now = Date.now();
+      if (now < summarizeRunningCooldownRef.current) return;
+      const hasActiveStream = !!llmProgress && Object.values(llmProgress).some(
+        (v) => v?.status === 'streaming' || v?.status === 'waiting',
+      );
+      if (hasActiveStream) return;
+      summarizeRunningCooldownRef.current = now + 15000;
+    }
+    if (summarizing || summarizeAutoRef.current) return;
+    summarizeAutoRef.current = true;
+    handleSummarize().finally(() => { summarizeAutoRef.current = false; });
+  }, [activeId, discStatus, unsummarizedCount, summarizing, handleSummarize, llmProgress]);
 
   const activeDisc = discussions.find(d => d.id === activeId);
   const isRunning = RUNNING_STATUSES.includes(detail?.status || '');
+  const latestMessageByAgent = (() => {
+    const byAgent = new Map<string, MessageResponse>();
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const m = messages[i];
+      if (!byAgent.has(m.agent_name)) byAgent.set(m.agent_name, m);
+    }
+    return byAgent;
+  })();
+  const formatChars = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
+  const agentProgressRows = agents
+    .filter(a => a.role !== 'user')
+    .map(a => {
+      const live = llmProgress?.[a.name];
+      const streamChars = streamingContent[a.name]?.length || 0;
+      const chars = Math.max(live?.chars || 0, streamChars);
+      const latest = latestMessageByAgent.get(a.name);
+      const ownedNow = roleOwnsPhase(a.role, phase);
+      const stepPhase = live?.phase || (ownedNow ? phase : latest?.phase || '');
+      const stepLabel = PHASE_LABELS[stepPhase] || stepPhase || 'Idle';
+
+      let statusText = 'idle';
+      if (live?.status === 'streaming') statusText = 'streaming';
+      else if (live?.status === 'waiting') statusText = 'waiting';
+      else if (live?.status === 'done') statusText = 'done';
+      else if (ownedNow) {
+        const alreadyDoneCurrentPhase = messages.some(m => m.agent_name === a.name && m.phase === phase);
+        statusText = alreadyDoneCurrentPhase ? 'done' : 'queued';
+      } else if (latest?.phase) statusText = 'done';
+
+      // Prefer stage-based wording while actively running so summary phases read as "总结中".
+      if (stepPhase && ['streaming', 'waiting', 'queued'].includes(statusText)) {
+        statusText = PHASE_LABELS[stepPhase] || stepPhase;
+      }
+
+      return {
+        name: a.name,
+        role: a.role,
+        stepLabel,
+        statusText,
+        chars,
+      };
+    });
 
   return (
     <div className="flex h-screen w-full overflow-hidden font-sans">
@@ -428,6 +1048,14 @@ export default function App() {
         onDownload={summaryDownloadUrl ? () => window.open(summaryDownloadUrl, '_blank') : undefined} />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onProvidersChange={() => listLLMProviders().then(setProviders).catch(() => {})} />
       <NewDebateModal isOpen={newDebateOpen} onClose={() => setNewDebateOpen(false)} onCreated={(d) => { refreshList(); setActiveId(d.id); }} />
+      <AgentConfigModal
+        isOpen={!!editingAgent}
+        onClose={() => setEditingAgent(null)}
+        agent={editingAgent}
+        discussionId={activeId}
+        onSave={(updated) => setAgents(prev => prev.map(a => a.id === updated.id ? updated : a))}
+        providers={providers}
+      />
 
       {/* Sidebar */}
       <motion.aside
@@ -557,9 +1185,10 @@ export default function App() {
                 </button>
                 {showHeaderMenu && (
                   <div className="absolute right-0 mt-2 w-64 bg-white dark:bg-slate-800 rounded-xl shadow-xl border border-slate-200 dark:border-slate-700 py-1 z-50 max-h-96 overflow-y-auto">
-                    <button onClick={() => { setShowHeaderMenu(false); handleStop(); }}
+                    <button onClick={() => { setShowHeaderMenu(false); if (discStatus === 'running') handleStop(); else handleResume(); }}
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
-                      <Square className="w-3.5 h-3.5" /> Stop Discussion
+                      {discStatus === 'running' ? <Square className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                      {discStatus === 'running' ? 'Pause Discussion' : 'Continue Discussion'}
                     </button>
                     <button onClick={() => { setShowHeaderMenu(false); handleReset(); }}
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
@@ -606,11 +1235,14 @@ export default function App() {
                 {agents.map(agent => (
                   <button key={agent.id} onClick={() => setEditingAgent(agent)}
                     className={`flex items-center gap-1.5 px-3 py-1 rounded-full border transition-colors ${
-                      agent.role === 'host' ? 'border-orange-200 bg-orange-50 hover:bg-orange-100 dark:border-orange-800/50 dark:bg-orange-900/20 dark:hover:bg-orange-900/40' :
+                      agent.role === 'host' ? 'border-blue-200 bg-blue-50 hover:bg-blue-100 dark:border-blue-800/50 dark:bg-blue-900/20 dark:hover:bg-blue-900/40' :
+                      agent.role === 'critic' ? 'border-orange-200 bg-orange-50 hover:bg-orange-100 dark:border-orange-800/50 dark:bg-orange-900/20 dark:hover:bg-orange-900/40' :
                       'border-violet-200 bg-violet-50 hover:bg-violet-100 dark:border-violet-800/50 dark:bg-violet-900/20 dark:hover:bg-violet-900/40'
                     }`}>
                     <span className={`text-sm font-bold ${
-                      agent.role === 'host' ? 'text-orange-700 dark:text-orange-400' : 'text-violet-700 dark:text-violet-400'
+                      agent.role === 'host' ? 'text-blue-700 dark:text-blue-400' :
+                      agent.role === 'critic' ? 'text-orange-700 dark:text-orange-400' :
+                      'text-violet-700 dark:text-violet-400'
                     }`}>{agent.name}</span>
                     <span className="text-xs text-slate-500 dark:text-slate-400">{agent.provider}/{agent.model}</span>
                   </button>
@@ -620,16 +1252,15 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        <AgentConfigModal
-          isOpen={!!editingAgent}
-          onClose={() => setEditingAgent(null)}
-          agent={editingAgent}
-          discussionId={activeId}
-          onSave={(updated) => setAgents(prev => prev.map(a => a.id === updated.id ? updated : a))}
-          providers={providers}
-        />
-
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4 scroll-smooth chat-container relative">
+        <div
+          ref={scrollRef}
+          onScroll={() => {
+            const el = scrollRef.current;
+            if (!el) return;
+            isMainNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+          }}
+          className="flex-1 overflow-y-auto px-4 py-4 scroll-smooth chat-container relative"
+        >
           <div className="max-w-[850px] mx-auto space-y-4 pb-48">
             {/* Empty / Loading / Ready states */}
             {!activeId && (
@@ -654,10 +1285,19 @@ export default function App() {
                 </button>
               </div>
             )}
+            {(discStatus === 'completed' || discStatus === 'waiting_input') && summarizing && (
+              <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
+                className="glass-card rounded-xl p-3 border border-emerald-200/70 dark:border-emerald-700/40 bg-emerald-50/70 dark:bg-emerald-900/10">
+                <div className="flex items-center gap-2 text-xs font-semibold text-emerald-700 dark:text-emerald-300">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  正在使用总结模型压缩内容 {summaryProgress || '...'}
+                </div>
+              </motion.div>
+            )}
 
             {/* Messages */}
             <AnimatePresence mode="popLayout">
-              {messages.map((msg, idx) => (
+              {displayMessages.map((msg, idx) => (
                 <motion.div key={msg.id || idx} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className={`flex gap-3 group ${msg.agent_role === 'user' ? 'flex-row-reverse' : ''}`}>
                   <div className="flex flex-col items-center pt-1 shrink-0">
                     <ModelAvatar provider={agents.find(a => a.name === msg.agent_name)?.provider} className="w-8 h-8" />
@@ -684,17 +1324,71 @@ export default function App() {
                         </div>
                       </div>
                       <div className="relative">
-                        {msg.summary ? (
+                        {msg.summary || (msg.id && streamingSummaries[msg.id]) ? (
                           <>
-                            <MarkdownRenderer content={msg.summary} />
+                            <MarkdownRenderer content={msg.summary || (msg.id ? streamingSummaries[msg.id] || '' : '')} />
+                            {!msg.summary && msg.id && streamingSummaries[msg.id] && (
+                              <div className="mt-2 text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                                总结中{summarizingMsgId === msg.id ? ` · ${summaryProgress || ''}` : ''}
+                              </div>
+                            )}
                             <button onClick={() => openSummary(msg.content, `Full message by ${msg.agent_name}`)}
                               className="mt-2 text-violet-600 dark:text-violet-400 text-xs hover:underline flex items-center gap-1">
                               <Maximize2 className="w-3 h-3" /> View full
                             </button>
                           </>
-                        ) : <MarkdownRenderer content={msg.content} />}
+                        ) : ['synthesizing', 'round_summary'].includes(msg.phase || '') || msg.agent_role === 'user' ? (
+                          msg.agent_role === 'user' && editingMsgIdx === idx ? (
+                            <div className="flex flex-col gap-2">
+                              <textarea value={editingContent} onChange={e => setEditingContent(e.target.value)}
+                                className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white resize-y min-h-[160px]"
+                                rows={7}
+                                autoFocus />
+                              <div className="flex gap-2 justify-end">
+                                <button onClick={() => setEditingMsgIdx(null)} className="px-2 py-1 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"><X className="w-3 h-3" /></button>
+                                <button onClick={async () => {
+                                  if (!activeId) return;
+                                  const nextText = editingContent.trim();
+                                  if (!nextText || nextText === msg.content) {
+                                    setEditingMsgIdx(null);
+                                    return;
+                                  }
+                                  try {
+                                    if (msg.id) {
+                                      await updateMessage(activeId, msg.id, nextText);
+                                      setMessages(prev => prev.map(m => m.id === msg.id ? { ...m, content: nextText } : m));
+                                    } else {
+                                      await updateTopic(activeId, nextText);
+                                      if (detail) setDetail({ ...detail, topic: nextText });
+                                    }
+                                    setEditingMsgIdx(null);
+                                  } catch (e: unknown) {
+                                    setError(e instanceof Error ? e.message : '修改失败');
+                                  }
+                                }} className="px-2 py-1 text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"><Check className="w-3 h-3" /></button>
+                              </div>
+                            </div>
+                          ) : <MarkdownRenderer content={msg.content} />
+                        ) : summarizingMsgId === msg.id ? (
+                          <div className="text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                            总结中 · {summaryProgress || '准备中...'}
+                          </div>
+                        ) : (
+                          <button onClick={() => openSummary(msg.content, `${msg.agent_name} — ${PHASE_LABELS[msg.phase || ''] || msg.phase}`)}
+                            className="text-slate-500 dark:text-slate-400 text-xs hover:text-violet-600 dark:hover:text-violet-400 flex items-center gap-1">
+                            <Maximize2 className="w-3 h-3" /> {msg.content.length >= 1000 ? `${(msg.content.length / 1000).toFixed(1)}k` : msg.content.length} 字符 · 点击查看
+                          </button>
+                        )}
                       </div>
                       <div className="absolute -bottom-3 right-6 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                        {msg.agent_role === 'user' && (
+                          <button onClick={() => { setEditingMsgIdx(idx); setEditingContent(msg.content); }}
+                            className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-emerald-500 hover:scale-110 transition" title="Edit">
+                            <Pencil className="w-3 h-3" />
+                          </button>
+                        )}
                         <button onClick={() => copyToClipboard(msg.content)}
                           className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-blue-500 hover:scale-110 transition" title="Copy">
                           <Copy className="w-3 h-3" />
@@ -712,20 +1406,50 @@ export default function App() {
               ))}
             </AnimatePresence>
 
-            {/* Streaming progress */}
-            {discStatus === 'running' && llmProgress && Object.keys(llmProgress).length > 0 && (
-              <div className="flex items-center gap-2 text-sm text-slate-500 pl-12">
-                <Loader2 className="w-4 h-4 animate-spin text-violet-500" />
-                {Object.entries(llmProgress).map(([name, { chars, status }]) => (
-                  <span key={name} className="text-xs">
-                    {name} {status === 'done' ? 'done' : status === 'waiting' ? 'waiting...' : `thinking${chars > 0 ? ` (${chars > 1000 ? `${(chars/1000).toFixed(1)}k` : chars} chars)` : '...'}`}
-                  </span>
-                ))}
-              </div>
-            )}
-            {discStatus === 'running' && !llmProgress && (
-              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex gap-5 items-center pl-12 text-slate-400 text-sm italic">
-                <Loader2 className="w-4 h-4 animate-spin" /> Processing...
+            {Object.entries(streamingContent).map(([agentName, content]) => (
+              <motion.div key={`stream-${agentName}`} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="flex gap-3">
+                <div className="flex flex-col items-center pt-1 shrink-0">
+                  <ModelAvatar provider={agents.find(a => a.name === agentName)?.provider} className="w-8 h-8" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="glass-card rounded-xl rounded-tl-none p-4 shadow-sm border-l-4 border-l-emerald-500">
+                    <div className="flex items-center gap-2 mb-2 border-b border-slate-100 dark:border-slate-700/50 pb-2">
+                      <span className="font-bold text-slate-900 dark:text-white text-sm">{agentName}</span>
+                      <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">streaming</span>
+                    </div>
+                    <MarkdownRenderer content={content} />
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+
+            {/* Live per-agent progress */}
+            {discStatus === 'running' && agentProgressRows.length > 0 && (
+              <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="glass-card rounded-xl p-3 border border-slate-200/60 dark:border-slate-700/60">
+                <div className="flex items-center gap-2 text-xs font-semibold text-slate-600 dark:text-slate-300 mb-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />
+                  Agent Live Progress
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                  {agentProgressRows.map((row) => (
+                    <div key={row.name} className="rounded-lg border border-slate-200/60 dark:border-slate-700/60 px-3 py-2 bg-white/50 dark:bg-slate-800/30">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 truncate">{row.name}</span>
+                        <span className={`text-[10px] uppercase tracking-wide font-semibold ${
+                          row.statusText === 'done' ? 'text-emerald-600 dark:text-emerald-300' :
+                          ['规划中', '讨论中', '反思中', '总结中', '轮次总结中', '下一步规划中', 'streaming', 'waiting', 'queued'].includes(row.statusText) ? 'text-violet-600 dark:text-violet-300' :
+                          'text-slate-500 dark:text-slate-400'
+                        }`}>
+                          {row.statusText}
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">{row.stepLabel}</div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                        已接收 {formatChars(row.chars)} 字
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </motion.div>
             )}
           </div>
@@ -823,7 +1547,15 @@ export default function App() {
           </div>
         </div>
 
-        <div ref={observerScrollRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div
+          ref={observerScrollRef}
+          onScroll={() => {
+            const el = observerScrollRef.current;
+            if (!el) return;
+            isObserverNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
+          }}
+          className="flex-1 overflow-y-auto p-4 space-y-4"
+        >
           {observerMessages.map((msg) => (
             <div key={msg.id} className="group flex flex-col gap-1.5">
               <div className="flex items-center gap-2 px-1">
@@ -873,7 +1605,7 @@ export default function App() {
             />
             <button
               onClick={handleObserverSend}
-              disabled={!observerInput.trim() || observerStreaming || !observerConfig.provider}
+              disabled={!observerInput.trim() || observerStreaming || !observerConfig.providerId || !observerConfig.model}
               className="p-1.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-50 text-white rounded-lg transition shadow-sm flex items-center justify-center w-8 h-8 shrink-0"
             >
               {observerStreaming ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUp className="w-4 h-4" />}

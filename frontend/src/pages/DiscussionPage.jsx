@@ -6,6 +6,7 @@ const PHASE_LABELS = {
   discussing: '讨论中',
   reflecting: '反思中',
   synthesizing: '总结中',
+  round_summary: '轮次总结中',
 }
 
 const ROLE_LABELS = {
@@ -20,6 +21,404 @@ function formatTime(ts) {
   const s = String(ts)
   const d = new Date(s.includes('Z') || s.includes('+') ? s : s + 'Z')
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+let mermaidScriptPromise = null
+let mathJaxScriptPromise = null
+let mermaidInitialized = false
+
+function loadScriptOnce(src, checkLoaded) {
+  if (checkLoaded()) return Promise.resolve()
+  const existing = Array.from(document.getElementsByTagName('script')).find(s => s.src === src)
+  if (existing) {
+    return new Promise((resolve, reject) => {
+      if (checkLoaded()) {
+        resolve()
+        return
+      }
+      existing.addEventListener('load', () => resolve(), { once: true })
+      existing.addEventListener('error', () => reject(new Error(`Failed to load script: ${src}`)), { once: true })
+    })
+  }
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = src
+    script.async = true
+    script.onload = () => resolve()
+    script.onerror = () => reject(new Error(`Failed to load script: ${src}`))
+    document.head.appendChild(script)
+  })
+}
+
+async function ensureMermaidLoaded() {
+  if (!mermaidScriptPromise) {
+    mermaidScriptPromise = loadScriptOnce(
+      'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js',
+      () => typeof window.mermaid !== 'undefined',
+    )
+  }
+  await mermaidScriptPromise
+  if (window.mermaid && !mermaidInitialized) {
+    window.mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: 'loose',
+      theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
+    })
+    mermaidInitialized = true
+  }
+}
+
+async function ensureMathJaxLoaded() {
+  if (!mathJaxScriptPromise) {
+    window.MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+      },
+      svg: { fontCache: 'global' },
+      options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+      startup: { typeset: false },
+    }
+    mathJaxScriptPromise = loadScriptOnce(
+      'https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js',
+      () => typeof window.MathJax?.typesetPromise === 'function',
+    )
+  }
+  await mathJaxScriptPromise
+}
+
+function normalizeMarkdown(text) {
+  const lines = String(text || '').replace(/\r/g, '').split('\n')
+  const normalized = []
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i] || ''
+    const line = raw
+      .replace(/^(\s*)(\d+)[、）]\s+/, '$1$2. ')
+      .replace(/^(\s*)[•●·]\s+/, '$1- ')
+    const isList = /^\s*([-*+]\s+|\d+[.)]\s+)/.test(line)
+    const prev = normalized.length ? normalized[normalized.length - 1] : ''
+    const prevIsList = /^\s*([-*+]\s+|\d+[.)]\s+)/.test(prev)
+    if (isList && prev && prev.trim() && !prevIsList) {
+      normalized.push('')
+    }
+    normalized.push(line)
+  }
+  return normalized
+}
+
+function splitTableRow(line) {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map(cell => cell.trim())
+}
+
+function isTableSeparatorLine(line) {
+  return /^(\s*\|)?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+(\|)?\s*$/.test(line)
+}
+
+function isBlockStart(line) {
+  return (
+    /^```/.test(line) ||
+    /^#{1,6}\s+/.test(line) ||
+    /^>\s?/.test(line) ||
+    /^([-*_]\s*){3,}$/.test(line.trim()) ||
+    /^\s*[-*+]\s+/.test(line) ||
+    /^\s*\d+[.)]\s+/.test(line)
+  )
+}
+
+function parseMarkdownBlocks(text) {
+  const lines = normalizeMarkdown(text)
+  const blocks = []
+  let i = 0
+  while (i < lines.length) {
+    const line = lines[i]
+    if (!line || !line.trim()) {
+      i += 1
+      continue
+    }
+
+    const codeStart = line.match(/^```([\w-]+)?\s*$/)
+    if (codeStart) {
+      const lang = (codeStart[1] || '').toLowerCase()
+      i += 1
+      const codeLines = []
+      while (i < lines.length && !/^```/.test(lines[i])) {
+        codeLines.push(lines[i])
+        i += 1
+      }
+      if (i < lines.length) i += 1
+      blocks.push({ type: 'code', lang, content: codeLines.join('\n') })
+      continue
+    }
+
+    if (/^#{1,6}\s+/.test(line)) {
+      const level = Math.min(6, line.match(/^#+/)[0].length)
+      const content = line.replace(/^#{1,6}\s+/, '')
+      blocks.push({ type: 'heading', level, content })
+      i += 1
+      continue
+    }
+
+    if (/^([-*_]\s*){3,}$/.test(line.trim())) {
+      blocks.push({ type: 'hr' })
+      i += 1
+      continue
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines = []
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ''))
+        i += 1
+      }
+      blocks.push({ type: 'blockquote', lines: quoteLines })
+      continue
+    }
+
+    if (line.includes('|') && i + 1 < lines.length && isTableSeparatorLine(lines[i + 1])) {
+      const headers = splitTableRow(line)
+      i += 2
+      const rows = []
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(splitTableRow(lines[i]))
+        i += 1
+      }
+      blocks.push({ type: 'table', headers, rows })
+      continue
+    }
+
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = []
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*[-*+]\s+(.+)$/)
+        if (!m) break
+        items.push(m[1])
+        i += 1
+      }
+      blocks.push({ type: 'ul', items })
+      continue
+    }
+
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = []
+      while (i < lines.length) {
+        const m = lines[i].match(/^\s*\d+[.)]\s+(.+)$/)
+        if (!m) break
+        items.push(m[1])
+        i += 1
+      }
+      blocks.push({ type: 'ol', items })
+      continue
+    }
+
+    if (/^\s*(\$\$|\\\[)\s*$/.test(line)) {
+      const open = line.trim()
+      const close = open === '$$' ? '$$' : '\\]'
+      i += 1
+      const mathLines = []
+      while (i < lines.length && lines[i].trim() !== close) {
+        mathLines.push(lines[i])
+        i += 1
+      }
+      if (i < lines.length) i += 1
+      blocks.push({ type: 'math', content: `${open}\n${mathLines.join('\n')}\n${close}` })
+      continue
+    }
+
+    const paragraph = []
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+      paragraph.push(lines[i])
+      i += 1
+    }
+    blocks.push({ type: 'paragraph', lines: paragraph })
+  }
+  return blocks
+}
+
+function renderInlineMarkdown(text, keyPrefix) {
+  const content = String(text || '')
+  const result = []
+  const tokenRegex = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_[^_\n]+_|\[[^\]]+\]\((https?:\/\/[^\s)]+)\))/g
+  let last = 0
+  let match
+  let key = 0
+
+  while ((match = tokenRegex.exec(content)) !== null) {
+    if (match.index > last) {
+      result.push(<span key={`${keyPrefix}-txt-${key++}`}>{content.slice(last, match.index)}</span>)
+    }
+    const token = match[0]
+    if ((token.startsWith('**') && token.endsWith('**')) || (token.startsWith('__') && token.endsWith('__'))) {
+      result.push(<strong key={`${keyPrefix}-b-${key++}`}>{token.slice(2, -2)}</strong>)
+    } else if ((token.startsWith('*') && token.endsWith('*')) || (token.startsWith('_') && token.endsWith('_'))) {
+      result.push(<em key={`${keyPrefix}-i-${key++}`}>{token.slice(1, -1)}</em>)
+    } else if (token.startsWith('`') && token.endsWith('`')) {
+      result.push(<code key={`${keyPrefix}-c-${key++}`}>{token.slice(1, -1)}</code>)
+    } else if (token.startsWith('[')) {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/)
+      if (link) {
+        result.push(
+          <a key={`${keyPrefix}-a-${key++}`} href={link[2]} target="_blank" rel="noreferrer">
+            {link[1]}
+          </a>
+        )
+      } else {
+        result.push(<span key={`${keyPrefix}-txt-${key++}`}>{token}</span>)
+      }
+    } else {
+      result.push(<span key={`${keyPrefix}-txt-${key++}`}>{token}</span>)
+    }
+    last = tokenRegex.lastIndex
+  }
+  if (last < content.length) {
+    result.push(<span key={`${keyPrefix}-txt-${key++}`}>{content.slice(last)}</span>)
+  }
+  return result
+}
+
+function MermaidBlock({ code }) {
+  const ref = useRef(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const renderDiagram = async () => {
+      try {
+        setError(null)
+        await ensureMermaidLoaded()
+        if (!window.mermaid) throw new Error('Mermaid is unavailable')
+        const id = `mermaid-${Math.random().toString(36).slice(2)}`
+        const { svg } = await window.mermaid.render(id, code)
+        if (!cancelled && ref.current) {
+          ref.current.innerHTML = svg
+        }
+      } catch (e) {
+        if (!cancelled) setError(e?.message || 'Failed to render mermaid')
+      }
+    }
+    renderDiagram()
+    return () => { cancelled = true }
+  }, [code])
+
+  if (error) {
+    return <div className="md-mermaid-error">Mermaid render error: {error}</div>
+  }
+  return <div ref={ref} className="md-mermaid" />
+}
+
+function MarkdownRenderer({ text, className = '' }) {
+  const content = String(text || '')
+  const blocks = parseMarkdownBlocks(content)
+  const containerRef = useRef(null)
+
+  useEffect(() => {
+    let cancelled = false
+    const typesetMath = async () => {
+      if (!content) return
+      try {
+        await ensureMathJaxLoaded()
+        if (cancelled || !containerRef.current || !window.MathJax?.typesetPromise) return
+        await window.MathJax.typesetPromise([containerRef.current])
+      } catch {
+        // Fallback to plain markdown text if MathJax is unavailable.
+      }
+    }
+    typesetMath()
+    return () => { cancelled = true }
+  }, [content])
+
+  if (!content) return null
+
+  return (
+    <div ref={containerRef} className={`md-render ${className}`.trim()}>
+      {blocks.map((block, idx) => {
+        const key = `blk-${idx}`
+        if (block.type === 'heading') {
+          const Tag = `h${block.level}`
+          return <Tag key={key} className={`md-h md-h${block.level}`}>{renderInlineMarkdown(block.content, key)}</Tag>
+        }
+        if (block.type === 'hr') return <hr key={key} className="md-hr" />
+        if (block.type === 'blockquote') {
+          return (
+            <blockquote key={key} className="md-blockquote">
+              {block.lines.map((line, lineIdx) => (
+                <p key={`${key}-q-${lineIdx}`} className="md-quote-line">
+                  {renderInlineMarkdown(line, `${key}-q-${lineIdx}`)}
+                </p>
+              ))}
+            </blockquote>
+          )
+        }
+        if (block.type === 'ul') {
+          return (
+            <ul key={key} className="md-list md-ul">
+              {block.items.map((item, itemIdx) => (
+                <li key={`${key}-uli-${itemIdx}`}>{renderInlineMarkdown(item, `${key}-uli-${itemIdx}`)}</li>
+              ))}
+            </ul>
+          )
+        }
+        if (block.type === 'ol') {
+          return (
+            <ol key={key} className="md-list md-ol">
+              {block.items.map((item, itemIdx) => (
+                <li key={`${key}-oli-${itemIdx}`}>{renderInlineMarkdown(item, `${key}-oli-${itemIdx}`)}</li>
+              ))}
+            </ol>
+          )
+        }
+        if (block.type === 'table') {
+          return (
+            <div key={key} className="md-table-wrap">
+              <table className="md-table">
+                <thead>
+                  <tr>
+                    {block.headers.map((cell, cellIdx) => (
+                      <th key={`${key}-th-${cellIdx}`}>{renderInlineMarkdown(cell, `${key}-th-${cellIdx}`)}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {block.rows.map((row, rowIdx) => (
+                    <tr key={`${key}-tr-${rowIdx}`}>
+                      {row.map((cell, cellIdx) => (
+                        <td key={`${key}-td-${rowIdx}-${cellIdx}`}>{renderInlineMarkdown(cell, `${key}-td-${rowIdx}-${cellIdx}`)}</td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+        if (block.type === 'math') {
+          return <div key={key} className="md-math-block">{block.content}</div>
+        }
+        if (block.type === 'code') {
+          if (block.lang === 'mermaid') return <MermaidBlock key={key} code={block.content} />
+          return (
+            <pre key={key} className="md-pre">
+              <code className={block.lang ? `language-${block.lang}` : ''}>{block.content}</code>
+            </pre>
+          )
+        }
+        return (
+          <p key={key} className="md-paragraph">
+            {block.lines.map((line, lineIdx) => (
+              <span key={`${key}-p-${lineIdx}`}>
+                {renderInlineMarkdown(line, `${key}-p-${lineIdx}`)}
+                {lineIdx < block.lines.length - 1 && <br />}
+              </span>
+            ))}
+          </p>
+        )
+      })}
+    </div>
+  )
 }
 
 export default function DiscussionPage({ discussionId }) {
@@ -37,6 +436,7 @@ export default function DiscussionPage({ discussionId }) {
   const [summarizing, setSummarizing] = useState(false)
   const [summaryProgress, setSummaryProgress] = useState(null)
   const [summarizingMsgId, setSummarizingMsgId] = useState(null)
+  const [streamingSummaries, setStreamingSummaries] = useState({})
   const [editingAgentId, setEditingAgentId] = useState(null)
   const [materialsModalOpen, setMaterialsModalOpen] = useState(false)
   const [textViewContent, setTextViewContent] = useState(null) // { filename, content }
@@ -62,7 +462,7 @@ export default function DiscussionPage({ discussionId }) {
     if (isNearBottomRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [messages])
+  }, [messages, streamingSummaries])
 
   // Poll for updates when discussion is running (e.g. after page refresh)
   const startPolling = useCallback(() => {
@@ -223,8 +623,14 @@ export default function DiscussionPage({ discussionId }) {
     streamRef.current?.abort()
     try { await stopDiscussion(discussionId) } catch {}
     setLlmProgress(null)
-    setStatus('completed')
+    setStatus('waiting_input')
     setPhase('')
+  }
+
+  const handleResume = () => {
+    if (status === 'running') return
+    setError(null)
+    startDiscussion()
   }
 
   const handleReplan = async () => {
@@ -322,26 +728,48 @@ export default function DiscussionPage({ discussionId }) {
   const unsummarizedCount = messages.filter(m => (m.content || '').length >= 200 && !m.summary).length
 
   const handleSummarize = useCallback(async () => {
+    const resolveSummaryMsgId = (event) => event?.message_id ?? event?.round_number ?? null
+
     setSummarizing(true)
     setSummaryProgress(null)
     setSummarizingMsgId(null)
+    setStreamingSummaries({})
     await streamSummarize(
       discussionId,
       (event) => {
         if (event.event_type === 'summary_progress') {
           setSummaryProgress(event.content)
-          setSummarizingMsgId(event.round_number)
+          setSummarizingMsgId(resolveSummaryMsgId(event))
+        }
+        if (event.event_type === 'summary_chunk') {
+          const msgId = resolveSummaryMsgId(event)
+          if (msgId == null) return
+          setSummarizingMsgId(msgId)
+          setStreamingSummaries(prev => ({
+            ...prev,
+            [msgId]: event.content || '',
+          }))
         }
         if (event.event_type === 'summary_done') {
-          const msgId = event.round_number
+          const msgId = resolveSummaryMsgId(event)
           setSummarizingMsgId(null)
-          setMessages(prev => prev.map(m =>
-            m.id === msgId ? { ...m, summary: event.content } : m
-          ))
+          if (msgId != null) {
+            setStreamingSummaries(prev => {
+              const next = { ...prev }
+              delete next[msgId]
+              return next
+            })
+            setMessages(prev => prev.map(m =>
+              m.id === msgId ? { ...m, summary: event.content } : m
+            ))
+          }
+        }
+        if (event.event_type === 'summary_error') {
+          setError(event.content || '消息总结失败')
         }
       },
-      (errMsg) => { setError(errMsg); setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null) },
-      () => { setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null) },
+      (errMsg) => { setError(errMsg); setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null); setStreamingSummaries({}) },
+      () => { setSummarizing(false); setSummaryProgress(null); setSummarizingMsgId(null); setStreamingSummaries({}) },
     )
   }, [discussionId])
 
@@ -464,8 +892,11 @@ export default function DiscussionPage({ discussionId }) {
               <button className="phase-indicator phase-btn" onClick={handleReplan}>
                 ↻ 全部重新规划
               </button>
-              <button className="phase-indicator phase-btn danger" onClick={handleStop}>
-                ■ 停止
+              <button
+                className={`phase-indicator phase-btn ${status === 'running' ? 'danger' : ''}`}
+                onClick={status === 'running' ? handleStop : handleResume}
+              >
+                {status === 'running' ? '■ 暂停' : '▶ 继续'}
               </button>
               <button className="phase-indicator phase-btn" onClick={() => setMaterialsModalOpen(true)}>
                 📎 资料
@@ -611,7 +1042,15 @@ export default function DiscussionPage({ discussionId }) {
 
         <div className="messages-container">
           {messages.map((msg, idx) => (
-            <MessageBubble key={msg.id || idx} msg={msg} summarizingMsgId={summarizingMsgId} summarizing={summarizing} onDelete={handleDeleteMessage} onEdit={handleEditMessage} />
+            <MessageBubble
+              key={msg.id || idx}
+              msg={msg}
+              summarizingMsgId={summarizingMsgId}
+              summarizing={summarizing}
+              streamingSummary={streamingSummaries[msg.id]}
+              onDelete={handleDeleteMessage}
+              onEdit={handleEditMessage}
+            />
           ))}
           <div ref={messagesEndRef} />
         </div>
@@ -690,7 +1129,7 @@ export default function DiscussionPage({ discussionId }) {
 
 
 function StreamingStatus({ agents, phase, llmProgress, messages, currentRound, polling }) {
-  const phaseLabel = { planning: '规划中', discussing: '讨论中', reflecting: '反思中', synthesizing: '总结中' }
+  const phaseLabel = { planning: '规划中', discussing: '讨论中', reflecting: '反思中', synthesizing: '总结中', round_summary: '轮次总结中' }
   const formatChars = (n) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 
   // SSE mode: use llmProgress
@@ -879,13 +1318,16 @@ function ObserverPanel({ discussionId, providers, config, onConfigChange, messag
       <div className="observer-messages">
         {messages.map((msg, idx) => (
           <div key={msg.id || idx} className={`observer-msg observer-msg-${msg.role}`}>
-            <div className="observer-msg-content">{msg.content}</div>
+            <MarkdownRenderer text={msg.content} className="observer-msg-content" />
             <CopyButton text={msg.content} />
           </div>
         ))}
         {streaming && streamText && (
           <div className="observer-msg observer-msg-observer">
-            <div className="observer-msg-content">{streamText}<span className="typing-cursor" /></div>
+            <div className="observer-msg-content observer-msg-streaming">
+              <MarkdownRenderer text={streamText} />
+              <span className="typing-cursor" />
+            </div>
           </div>
         )}
         {streaming && !streamText && (
@@ -1076,7 +1518,7 @@ function CopyButton({ text }) {
 }
 
 
-function MessageBubble({ msg, summarizingMsgId, summarizing, onDelete, onEdit }) {
+function MessageBubble({ msg, summarizingMsgId, summarizing, streamingSummary, onDelete, onEdit }) {
   const role = msg.agent_role || 'panelist'
   const isUser = role === 'user'
   const isLong = (msg.content || '').length >= 200
@@ -1092,12 +1534,14 @@ function MessageBubble({ msg, summarizingMsgId, summarizing, onDelete, onEdit })
 
   const roleIcon = { host: '🎯', critic: '🔍', panelist: '💡', user: '👤' }
 
+  const effectiveSummary = hasSummary ? msg.summary : (isSummarizing && streamingSummary ? streamingSummary : null)
+
   const displayText = !isLong
     ? msg.content
     : expanded
       ? msg.content
-      : hasSummary
-        ? msg.summary
+      : effectiveSummary
+        ? effectiveSummary
         : `${msg.agent_name} 总结中...`
 
   const handleSaveEdit = () => {
@@ -1154,7 +1598,7 @@ function MessageBubble({ msg, summarizingMsgId, summarizing, onDelete, onEdit })
         </div>
       ) : (
         <div className={`message-content ${!expanded && isLong ? 'collapsed' : ''}`}>
-          {displayText}
+          <MarkdownRenderer text={displayText} />
           <CopyButton text={msg.content} />
         </div>
       )}

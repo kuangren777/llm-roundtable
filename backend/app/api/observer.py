@@ -29,6 +29,10 @@ async def clear_history(discussion_id: int, db: AsyncSession = Depends(get_db)):
 @router.post("/chat")
 async def observer_chat(discussion_id: int, req: ObserverChatRequest, db: AsyncSession = Depends(get_db)):
     """Stream observer response via SSE."""
+    logger.info(
+        "Observer chat request received: discussion_id=%s provider=%s model=%s provider_id=%s",
+        discussion_id, req.provider, req.model, req.provider_id,
+    )
     async def event_stream():
         try:
             async for event in chat_with_observer(db, discussion_id, req):
