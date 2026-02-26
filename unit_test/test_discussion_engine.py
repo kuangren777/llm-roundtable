@@ -1,16 +1,26 @@
 """Tests for discussion engine helper functions and graph structure."""
-import sys
+import asyncio
+import json
 import os
+import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from backend.app.services.discussion_engine import (
+    _pending_user_messages,
+    _call_with_progress,
     _get_agent_by_role,
     _get_agents_by_role,
     _format_history,
     _parse_host_routing,
+    build_discussion_graph,
+    panelist_discussion_node,
+    host_next_step_planning_node,
+    progress_queue_var,
     route_after_host_planning,
+    route_after_panelist_discussion,
+    route_after_round_summary,
     should_continue_or_synthesize,
     AgentInfo,
 )
@@ -53,6 +63,8 @@ def _make_state(**overrides) -> dict:
         "intent_judgment": "",
         "host_position": "",
         "open_tasks": [],
+        "next_step_plan": "",
+        "round_summaries": [],
         "cycle_index": 0,
     }
     defaults.update(overrides)
@@ -156,14 +168,6 @@ class TestShouldContinueOrSynthesize:
         state = _make_state(current_round=0, max_rounds=1)
         assert should_continue_or_synthesize(state) == "synthesize"
 
-    def test_single_round_followup_stops_without_synthesis(self):
-        state = _make_state(single_round_mode=True, needs_synthesis=False)
-        assert should_continue_or_synthesize(state) == "stop"
-
-    def test_single_round_followup_can_synthesize(self):
-        state = _make_state(single_round_mode=True, needs_synthesis=True)
-        assert should_continue_or_synthesize(state) == "synthesize"
-
 
 class TestHostRoutingParsing:
     def test_parses_selected_panelists_and_tasks(self):
@@ -241,14 +245,250 @@ class TestHostRoutingParsing:
 
 
 class TestHostPlanningRoute:
-    def test_host_only_without_synthesis_stops(self):
-        state = _make_state(execution_mode="host_only", needs_synthesis=False)
-        assert route_after_host_planning(state) == "stop"
-
-    def test_host_only_with_synthesis_routes_to_synthesis(self):
+    def test_always_routes_to_panelists(self):
         state = _make_state(execution_mode="host_only", needs_synthesis=True)
-        assert route_after_host_planning(state) == "synthesize"
-
-    def test_panelists_mode_routes_to_panelists(self):
-        state = _make_state(execution_mode="panelists", needs_synthesis=True)
         assert route_after_host_planning(state) == "panelists"
+        state = _make_state(execution_mode="panelists", needs_synthesis=False)
+        assert route_after_host_planning(state) == "panelists"
+
+
+class TestRoundRoutes:
+    def test_incremental_mode_goes_to_critic(self):
+        state = _make_state(single_round_mode=True)
+        assert route_after_panelist_discussion(state) == "critic"
+
+    def test_multi_round_goes_to_critic(self):
+        state = _make_state(single_round_mode=False)
+        assert route_after_panelist_discussion(state) == "critic"
+
+    def test_incremental_mode_stops_after_round_summary(self):
+        state = _make_state(single_round_mode=True)
+        assert route_after_round_summary(state) == "stop"
+
+    def test_multi_round_also_stops_after_round_summary(self):
+        state = _make_state(single_round_mode=False)
+        assert route_after_round_summary(state) == "stop"
+
+
+@pytest.mark.asyncio
+async def test_call_with_progress_can_disable_streaming(monkeypatch):
+    captured = {"call_llm": 0, "call_llm_stream": 0}
+
+    async def fake_call_llm(**kwargs):
+        captured["call_llm"] += 1
+        return "non-stream-result"
+
+    async def fake_call_llm_stream(**kwargs):
+        captured["call_llm_stream"] += 1
+        return ("stream-result", 12)
+
+    monkeypatch.setattr("backend.app.services.discussion_engine.call_llm", fake_call_llm)
+    monkeypatch.setattr("backend.app.services.discussion_engine.call_llm_stream", fake_call_llm_stream)
+
+    queue = asyncio.Queue()
+    token = progress_queue_var.set(queue)
+    try:
+        result = await _call_with_progress(
+            _make_agent("Host", "host"),
+            messages=[{"role": "user", "content": "test"}],
+            phase="round_summary",
+            use_stream=False,
+        )
+    finally:
+        progress_queue_var.reset(token)
+
+    assert result == "non-stream-result"
+    assert captured["call_llm"] == 1
+    assert captured["call_llm_stream"] == 0
+
+    events = []
+    while not queue.empty():
+        events.append(await queue.get())
+    assert events[0][0] == "progress_event"
+    assert events[0][1]["status"] == "waiting"
+    assert events[-1][0] == "progress_event"
+    assert events[-1][1]["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_graph_stops_after_round_summary(monkeypatch):
+    async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
+        if phase == "planning":
+            return json.dumps({
+                "intent_judgment": "测试意图",
+                "host_position": "测试观点",
+                "discussion_plan": "测试主线",
+                "execution_mode": "panelists",
+                "selected_panelists": ["A", "B"],
+                "assignments": [{"panelist": "A", "task": "A任务"}, {"panelist": "B", "task": "B任务"}],
+                "open_tasks": ["校验关键假设"],
+                "needs_synthesis": False,
+            })
+        if phase == "discussing":
+            return f"{agent['name']} 观点"
+        if phase == "reflecting":
+            return "批评家反馈"
+        if phase == "round_summary":
+            return "本轮总结"
+        if phase == "next_step_planning":
+            return "下一步规划"
+        if phase == "synthesizing":
+            return "最终完整总结"
+        return "ok"
+
+    monkeypatch.setattr("backend.app.services.discussion_engine._call_with_progress", fake_call)
+    _pending_user_messages.clear()
+
+    state = _make_state(
+        agents=[
+            _make_agent("Host", "host"),
+            _make_agent("A", "panelist"),
+            _make_agent("B", "panelist"),
+            _make_agent("Critic", "critic"),
+        ],
+        max_rounds=2,
+        single_round_mode=False,
+        discussion_id=10,
+    )
+
+    graph = build_discussion_graph()
+    executed_nodes = []
+    async for update in graph.astream(state, stream_mode="updates"):
+        executed_nodes.extend(update.keys())
+
+    assert executed_nodes == [
+        "host_planning",
+        "panelist_discussion",
+        "critic_review",
+        "host_round_summary",
+    ]
+    assert executed_nodes.count("host_round_summary") == 1
+    assert executed_nodes.count("critic_review") == 1
+
+
+@pytest.mark.asyncio
+async def test_incremental_graph_is_single_round_with_critic(monkeypatch):
+    async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
+        if phase == "planning":
+            return json.dumps({
+                "discussion_plan": "增量问题处理",
+                "execution_mode": "panelists",
+                "selected_panelists": ["A"],
+                "assignments": [{"panelist": "A", "task": "回答用户追问"}],
+                "open_tasks": ["确认是否继续"],
+                "needs_synthesis": False,
+            })
+        if phase == "discussing":
+            return "A 的增量回答"
+        if phase == "round_summary":
+            return "增量轮次总结"
+        return "ok"
+
+    monkeypatch.setattr("backend.app.services.discussion_engine._call_with_progress", fake_call)
+    _pending_user_messages.clear()
+
+    state = _make_state(
+        agents=[
+            _make_agent("Host", "host"),
+            _make_agent("A", "panelist"),
+            _make_agent("Critic", "critic"),
+        ],
+        max_rounds=3,
+        single_round_mode=True,
+        discussion_id=11,
+    )
+
+    graph = build_discussion_graph()
+    executed_nodes = []
+    async for update in graph.astream(state, stream_mode="updates"):
+        executed_nodes.extend(update.keys())
+
+    assert executed_nodes == [
+        "host_planning",
+        "panelist_discussion",
+        "critic_review",
+        "host_round_summary",
+    ]
+    assert "host_next_step_planning" not in executed_nodes
+    assert "synthesis" not in executed_nodes
+
+
+@pytest.mark.asyncio
+async def test_next_step_planning_consumes_previous_round_user_questions(monkeypatch):
+    captured_prompt = {"text": ""}
+
+    async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
+        if phase == "next_step_planning":
+            captured_prompt["text"] = messages[1]["content"]
+            return "下一轮先处理用户插问"
+        return "ok"
+
+    monkeypatch.setattr("backend.app.services.discussion_engine._call_with_progress", fake_call)
+    _pending_user_messages.clear()
+    _pending_user_messages[99] = [{
+        "agent_name": "用户",
+        "content": "请补充风险边界定义",
+        "round_number": 0,
+        "cycle_index": 3,
+    }]
+
+    queue = asyncio.Queue()
+    token = progress_queue_var.set(queue)
+    try:
+        state = _make_state(
+            discussion_id=99,
+            current_round=0,
+            agents=[_make_agent("Host", "host"), _make_agent("A", "panelist"), _make_agent("Critic", "critic")],
+            round_summaries=[{"round": 0, "summary": "本轮已经发现边界不清"}],
+            critic_feedback="边界定义不足",
+        )
+        output = await host_next_step_planning_node(state)
+    finally:
+        progress_queue_var.reset(token)
+
+    assert output["phase"] == "next_step_planning"
+    assert output["next_step_plan"] == "下一轮先处理用户插问"
+    assert any(m.get("phase") == "user_input" and m.get("content") == "请补充风险边界定义" for m in output["messages"])
+    assert 99 not in _pending_user_messages
+    assert "请补充风险边界定义" in captured_prompt["text"]
+    evt_type, evt_payload = await queue.get()
+    assert evt_type == "user_message_consumed"
+    assert evt_payload["content"] == "请补充风险边界定义"
+
+
+@pytest.mark.asyncio
+async def test_panelists_emit_messages_as_they_finish(monkeypatch):
+    async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
+        if agent["name"] == "A":
+            await asyncio.sleep(0.03)
+        if agent["name"] == "B":
+            await asyncio.sleep(0.01)
+        return f"{agent['name']} 完成"
+
+    monkeypatch.setattr("backend.app.services.discussion_engine._call_with_progress", fake_call)
+    queue = asyncio.Queue()
+    token = progress_queue_var.set(queue)
+    try:
+        state = _make_state(
+            agents=[
+                _make_agent("Host", "host"),
+                _make_agent("A", "panelist"),
+                _make_agent("B", "panelist"),
+            ],
+            selected_panelists=["A", "B"],
+            panelist_tasks={"A": "A任务", "B": "B任务"},
+        )
+        output = await panelist_discussion_node(state)
+    finally:
+        progress_queue_var.reset(token)
+
+    events = []
+    while not queue.empty():
+        events.append(await queue.get())
+
+    node_events = [e for e in events if e[0] == "node_message"]
+    assert len(node_events) == 2
+    assert node_events[0][1]["agent_name"] == "B"
+    assert node_events[1][1]["agent_name"] == "A"
+    assert all(node_events[i][1].get("message_uid") for i in range(2))
+    assert len(output["messages"]) == 2

@@ -13,6 +13,8 @@ from .api.llm_providers import router as llm_providers_router
 from .api.settings import router as settings_router
 from .api.materials import router as materials_router
 from .api.observer import router as observer_router
+from .api.auth import router as auth_router
+from .api.share import router as share_router
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
@@ -43,6 +45,8 @@ app.include_router(llm_providers_router)
 app.include_router(settings_router)
 app.include_router(materials_router)
 app.include_router(observer_router)
+app.include_router(auth_router)
+app.include_router(share_router)
 
 
 @app.get("/api/health")

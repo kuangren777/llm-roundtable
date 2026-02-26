@@ -10,6 +10,7 @@ const STATUS_COLORS = {
   discussing: '#7c3aed',
   reflecting: '#b45309',
   synthesizing: '#047857',
+  round_summary: '#059669',
   completed: '#047857',
   failed: '#dc2626',
 }

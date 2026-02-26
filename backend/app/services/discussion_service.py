@@ -3,7 +3,9 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
+import string
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +13,7 @@ from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 from fastapi import UploadFile
 
-from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole, SystemSetting
+from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole, SystemSetting, DiscussionShare, User
 from ..schemas.schemas import DiscussionCreate, AgentConfigUpdate, DiscussionEvent
 from ..database import async_session
 from .discussion_engine import build_discussion_graph, AgentInfo, DiscussionState, progress_queue_var, _pending_user_messages
@@ -43,6 +45,8 @@ ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 # Minimum content length to trigger summarization (short messages don't need it)
 MIN_SUMMARY_LENGTH = 200
+CODE_ALPHABET = string.ascii_letters + string.digits
+CODE_LENGTH = 16
 
 RUNNING_DISCUSSION_STATUSES = {
     DiscussionStatus.PLANNING,
@@ -52,6 +56,19 @@ RUNNING_DISCUSSION_STATUSES = {
 }
 
 
+def _max_round_value(current_round: int | None, *candidates: object) -> int:
+    """Return monotonic round index from current value and optional candidates."""
+    result = int(current_round or 0)
+    for value in candidates:
+        try:
+            if value is None:
+                continue
+            result = max(result, int(value))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
 async def _broadcast_discussion_event(discussion_id: int, event: DiscussionEvent):
     subscribers = list(_live_subscribers.get(discussion_id, set()))
     for q in subscribers:
@@ -59,6 +76,38 @@ async def _broadcast_discussion_event(discussion_id: int, event: DiscussionEvent
             q.put_nowait(event)
         except Exception:
             continue
+
+
+def _generate_random_code(length: int = CODE_LENGTH) -> str:
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(length))
+
+
+async def _generate_unique_chat_code(db: AsyncSession, retries: int = 5) -> str:
+    for _ in range(retries):
+        code = _generate_random_code()
+        exists = await db.execute(select(Discussion.id).where(Discussion.chat_code == code))
+        if exists.scalar_one_or_none() is None:
+            return code
+    raise RuntimeError("Failed to generate unique chat code")
+
+
+async def _generate_unique_share_code(db: AsyncSession, retries: int = 5) -> str:
+    for _ in range(retries):
+        code = _generate_random_code()
+        exists = await db.execute(select(DiscussionShare.id).where(DiscussionShare.share_code == code))
+        if exists.scalar_one_or_none() is None:
+            return code
+    raise RuntimeError("Failed to generate unique share code")
+
+
+def _discussion_load_options():
+    return (
+        selectinload(Discussion.agents),
+        selectinload(Discussion.messages),
+        selectinload(Discussion.materials),
+        selectinload(Discussion.observer_messages),
+        selectinload(Discussion.shares),
+    )
 
 
 async def _stream_running_discussion_events(
@@ -218,7 +267,7 @@ async def _summarize_message_bg(message_id: int):
         logger.warning("Failed to summarize message %d: %s", message_id, e)
 
 
-async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discussion:
+async def create_discussion(db: AsyncSession, data: DiscussionCreate, owner_user_id: int | None = None) -> Discussion:
     # Snapshot global LLM providers + models into discussion.llm_configs
     result = await db.execute(
         select(LLMProvider)
@@ -249,7 +298,16 @@ async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discuss
         host_cfg = all_models[data.host_model_id]
         llm_configs_raw = [host_cfg] + [c for c in llm_configs_raw if c is not host_cfg]
 
+    if owner_user_id is None:
+        admin_result = await db.execute(select(User).order_by(User.id.asc()))
+        owner = admin_result.scalars().first()
+        if not owner:
+            raise ValueError("No user available to own discussion")
+        owner_user_id = owner.id
+
     discussion = Discussion(
+        chat_code=await _generate_unique_chat_code(db),
+        owner_user_id=owner_user_id,
         topic=data.topic,
         mode=data.mode,
         max_rounds=data.max_rounds,
@@ -295,13 +353,17 @@ async def create_discussion(db: AsyncSession, data: DiscussionCreate) -> Discuss
 async def get_discussion(db: AsyncSession, discussion_id: int) -> Discussion | None:
     result = await db.execute(
         select(Discussion)
-        .options(
-            selectinload(Discussion.agents),
-            selectinload(Discussion.messages),
-            selectinload(Discussion.materials),
-            selectinload(Discussion.observer_messages),
-        )
+        .options(*_discussion_load_options())
         .where(Discussion.id == discussion_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_discussion_by_chat_code(db: AsyncSession, chat_code: str) -> Discussion | None:
+    result = await db.execute(
+        select(Discussion)
+        .options(*_discussion_load_options())
+        .where(Discussion.chat_code == chat_code)
     )
     return result.scalar_one_or_none()
 
@@ -317,13 +379,73 @@ async def update_discussion_topic(db: AsyncSession, discussion_id: int, topic: s
     return disc
 
 
-async def list_discussions(db: AsyncSession) -> list[Discussion]:
-    result = await db.execute(
+async def list_discussions(db: AsyncSession, owner_user_id: int | None = None) -> list[Discussion]:
+    query = (
         select(Discussion)
         .options(selectinload(Discussion.agents))
         .order_by(Discussion.created_at.desc())
     )
+    if owner_user_id is not None:
+        query = query.where(Discussion.owner_user_id == owner_user_id)
+    result = await db.execute(query)
     return list(result.scalars().all())
+
+
+async def get_active_discussion_share(db: AsyncSession, discussion_id: int) -> DiscussionShare | None:
+    result = await db.execute(
+        select(DiscussionShare).where(
+            DiscussionShare.discussion_id == discussion_id,
+            DiscussionShare.is_active.is_(True),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def create_or_get_discussion_share(
+    db: AsyncSession,
+    discussion_id: int,
+    created_by_user_id: int,
+) -> DiscussionShare:
+    existing = await get_active_discussion_share(db, discussion_id)
+    if existing:
+        return existing
+
+    share = DiscussionShare(
+        discussion_id=discussion_id,
+        share_code=await _generate_unique_share_code(db),
+        is_active=True,
+        created_by_user_id=created_by_user_id,
+    )
+    db.add(share)
+    await db.commit()
+    await db.refresh(share)
+    return share
+
+
+async def revoke_discussion_share(db: AsyncSession, discussion_id: int) -> bool:
+    share = await get_active_discussion_share(db, discussion_id)
+    if not share:
+        return False
+    share.is_active = False
+    await db.commit()
+    return True
+
+
+async def get_discussion_by_share_code(db: AsyncSession, share_code: str) -> Discussion | None:
+    result = await db.execute(
+        select(DiscussionShare)
+        .options(
+            selectinload(DiscussionShare.discussion).options(*_discussion_load_options())
+        )
+        .where(
+            DiscussionShare.share_code == share_code,
+            DiscussionShare.is_active.is_(True),
+        )
+    )
+    share = result.scalar_one_or_none()
+    if not share:
+        return None
+    return share.discussion
 
 
 async def delete_discussion(db: AsyncSession, discussion_id: int) -> bool:
@@ -906,17 +1028,23 @@ async def run_discussion(
     # Starting a new run consumes any stale pause flag from previous runs.
     _manual_pause_requests.discard(discussion_id)
 
-    # WAITING_INPUT/COMPLETED follow-up runs are single-round (one round per user message),
-    # but only after at least one non-user discussion message exists.
+    # Decide which round index this run should start from.
+    # We no longer segment discussion by cycle_index; round number is monotonic.
     has_non_user_history = any(
         (getattr(m, "agent_role", None) != AgentRole.USER)
         and ((getattr(m, "phase", "") or "") != "user_input")
         for m in (discussion.messages or [])
     )
-    auto_single_round_mode = (
-        discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED)
-        and has_non_user_history
-    )
+    base_round = int(discussion.current_round or 0)
+    if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED) and has_non_user_history:
+        start_round = base_round + 1
+    else:
+        start_round = base_round
+
+    # Two-mode routing by round threshold:
+    # - start_round < max_rounds  => full multi-round flow
+    # - start_round >= max_rounds => single-round follow-up flow
+    auto_single_round_mode = start_round >= int(discussion.max_rounds or 0)
     if force_single_round is None:
         single_round_mode = auto_single_round_mode
     else:
@@ -1010,19 +1138,11 @@ async def run_discussion(
                 "phase": m.phase or "",
             })
 
-    existing_cycle = max((getattr(m, "cycle_index", 0) for m in discussion.messages), default=-1)
-    if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED):
-        cycle_index = existing_cycle + 1
-    elif existing_cycle >= 0:
-        cycle_index = existing_cycle
-    else:
-        cycle_index = 0
-
     initial_state: DiscussionState = {
         "topic": discussion.topic,
         "agents": agents,
         "messages": prior_messages,
-        "current_round": 0,
+        "current_round": start_round,
         "max_rounds": discussion.max_rounds,
         "host_plan": "",
         "critic_feedback": "",
@@ -1043,7 +1163,7 @@ async def run_discussion(
         "open_tasks": [],
         "next_step_plan": "",
         "round_summaries": [],
-        "cycle_index": cycle_index,
+        "cycle_index": 0,
     }
 
     discussion.status = DiscussionStatus.PLANNING
@@ -1117,13 +1237,17 @@ async def run_discussion(
                     agent_role=msg_data["agent_role"],
                     content=msg_data["content"],
                     round_number=msg_data.get("round_number", 0),
-                    cycle_index=msg_data.get("cycle_index", cycle_index),
+                    cycle_index=msg_data.get("cycle_index", 0),
                     phase=msg_data.get("phase", ""),
                 )
                 db.add(msg)
                 await db.flush()
                 if msg_uid:
                     persisted_message_uids.add(msg_uid)
+                discussion.current_round = _max_round_value(
+                    discussion.current_round,
+                    msg.round_number,
+                )
                 await db.commit()
 
                 if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
@@ -1137,7 +1261,7 @@ async def run_discussion(
                     phase=msg_data.get("phase", ""),
                     round_number=msg_data.get("round_number", 0),
                     message_id=msg.id,
-                    cycle_index=msg_data.get("cycle_index", cycle_index),
+                    cycle_index=msg_data.get("cycle_index", 0),
                     created_at=msg.created_at,
                 )
                 await _broadcast_discussion_event(discussion_id, event)
@@ -1199,7 +1323,7 @@ async def run_discussion(
                         agent_role=msg_data["agent_role"],
                         content=msg_data["content"],
                         round_number=msg_data.get("round_number", 0),
-                        cycle_index=msg_data.get("cycle_index", cycle_index),
+                        cycle_index=msg_data.get("cycle_index", 0),
                         phase=msg_data.get("phase", ""),
                     )
                     db.add(msg)
@@ -1216,7 +1340,7 @@ async def run_discussion(
                         phase=msg_data.get("phase", ""),
                         round_number=msg_data.get("round_number", 0),
                         message_id=msg.id,
-                        cycle_index=msg_data.get("cycle_index", cycle_index),
+                        cycle_index=msg_data.get("cycle_index", 0),
                         created_at=msg.created_at,
                     )
                     await _broadcast_discussion_event(discussion_id, event)
@@ -1231,7 +1355,15 @@ async def run_discussion(
                 if node_output.get("final_summary"):
                     discussion.final_summary = node_output["final_summary"]
 
-                discussion.current_round = node_output.get("current_round", discussion.current_round)
+                max_saved_round = max(
+                    (int(m.round_number) for m in saved_msgs if m.round_number is not None),
+                    default=None,
+                )
+                discussion.current_round = _max_round_value(
+                    discussion.current_round,
+                    node_output.get("current_round"),
+                    max_saved_round,
+                )
                 await db.commit()
 
                 # Fire background summarization for saved messages
@@ -1247,16 +1379,10 @@ async def run_discussion(
             event = DiscussionEvent(event_type="cycle_complete", content="讨论已暂停，可手动继续。")
             await _broadcast_discussion_event(discussion_id, event)
             yield event
-        elif single_round_mode:
+        else:
             discussion.status = DiscussionStatus.WAITING_INPUT
             await db.commit()
-            event = DiscussionEvent(event_type="cycle_complete", content="增量轮次结束，等待您的下一次输入...")
-            await _broadcast_discussion_event(discussion_id, event)
-            yield event
-        else:
-            discussion.status = DiscussionStatus.COMPLETED
-            await db.commit()
-            event = DiscussionEvent(event_type="complete", content="已完成全部预设轮次，并生成最终完整总结。")
+            event = DiscussionEvent(event_type="cycle_complete", content="轮次总结完成，等待您的下一次输入...")
             await _broadcast_discussion_event(discussion_id, event)
             yield event
 
@@ -1356,6 +1482,10 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     await db.flush()
                     if msg_uid:
                         persisted_message_uids.add(msg_uid)
+                    discussion.current_round = _max_round_value(
+                        discussion.current_round,
+                        msg.round_number,
+                    )
                     await db.commit()
 
                     if msg.id and len(msg.content) >= MIN_SUMMARY_LENGTH:
@@ -1436,7 +1566,15 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                     if node_output.get("final_summary"):
                         discussion.final_summary = node_output["final_summary"]
 
-                    discussion.current_round = node_output.get("current_round", discussion.current_round)
+                    max_saved_round = max(
+                        (int(m.round_number) for m in saved_msgs if m.round_number is not None),
+                        default=None,
+                    )
+                    discussion.current_round = _max_round_value(
+                        discussion.current_round,
+                        node_output.get("current_round"),
+                        max_saved_round,
+                    )
                     await db.commit()
 
                     for msg in saved_msgs:
@@ -1469,12 +1607,9 @@ async def _drain_queue(discussion_id: int, queue: asyncio.Queue, graph_task: asy
                 await db.commit()
                 event = DiscussionEvent(event_type="cycle_complete", content="讨论已暂停，可手动继续。")
             else:
-                discussion.status = DiscussionStatus.WAITING_INPUT if single_round_mode else DiscussionStatus.COMPLETED
+                discussion.status = DiscussionStatus.WAITING_INPUT
                 await db.commit()
-                if single_round_mode:
-                    event = DiscussionEvent(event_type="cycle_complete", content="增量轮次结束，等待您的下一次输入...")
-                else:
-                    event = DiscussionEvent(event_type="complete", content="已完成全部预设轮次，并生成最终完整总结。")
+                event = DiscussionEvent(event_type="cycle_complete", content="轮次总结完成，等待您的下一次输入...")
             await _broadcast_discussion_event(discussion_id, event)
             logger.info("Drain task completed for discussion %d", discussion_id)
 
@@ -1691,19 +1826,19 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
     into the end-of-round next-step planning node.
     """
     discussion = await get_discussion(db, discussion_id)
+    cycle_index = 0
+    round_number = 0
     if discussion:
-        existing_cycle = max((getattr(m, "cycle_index", 0) for m in discussion.messages), default=-1)
-        round_number = discussion.current_round or 0
-        if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED):
-            cycle_index = existing_cycle + 1
-            round_number = 0
-        elif existing_cycle >= 0:
-            cycle_index = existing_cycle
+        has_non_user_history = any(
+            (getattr(m, "agent_role", None) != AgentRole.USER)
+            and ((getattr(m, "phase", "") or "") != "user_input")
+            for m in (discussion.messages or [])
+        )
+        base_round = int(discussion.current_round or 0)
+        if discussion.status in (DiscussionStatus.WAITING_INPUT, DiscussionStatus.COMPLETED, DiscussionStatus.FAILED) and has_non_user_history:
+            round_number = base_round + 1
         else:
-            cycle_index = 0
-    else:
-        cycle_index = 0
-        round_number = 0
+            round_number = base_round
 
     msg = Message(
         discussion_id=discussion_id,
@@ -1723,7 +1858,7 @@ async def submit_user_input(db: AsyncSession, discussion_id: int, content: str) 
         "agent_name": "用户",
         "content": content,
         "round_number": round_number,
-        "cycle_index": cycle_index,
+        "cycle_index": 0,
     })
 
     return msg
@@ -1769,7 +1904,9 @@ async def truncate_messages_after(
 
     discussion.final_summary = None
     discussion.status = DiscussionStatus.WAITING_INPUT
-    discussion.current_round = (max(remaining_rounds) + 1) if remaining_rounds else 0
+    resumed_round = (max(remaining_rounds) + 1) if remaining_rounds else 0
+    # Keep round monotonic even when truncating older history.
+    discussion.current_round = max(int(discussion.current_round or 0), int(resumed_round))
 
     _pending_user_messages.pop(discussion_id, None)
     _manual_pause_requests.discard(discussion_id)

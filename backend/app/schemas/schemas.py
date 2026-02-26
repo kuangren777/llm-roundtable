@@ -119,6 +119,30 @@ class UserInputRequest(BaseModel):
     content: str
 
 
+class UserRegisterRequest(BaseModel):
+    email: str
+    password: str = Field(min_length=8, max_length=128)
+
+
+class UserLoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UserResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    is_active: bool
+    is_admin: bool
+    created_at: datetime
+
+
+class AuthStatusResponse(BaseModel):
+    user: UserResponse
+
+
 class TruncateMessagesRequest(BaseModel):
     message_id: Optional[int] = None
 
@@ -132,6 +156,7 @@ class ObserverChatRequest(BaseModel):
     provider: str
     model: str
     provider_id: Optional[int] = None  # resolve api_key/base_url from LLMProvider table
+    reuse_message_id: Optional[int] = None  # reuse an existing edited observer user message
 
 
 class ObserverMessageResponse(BaseModel):
@@ -189,6 +214,7 @@ class DiscussionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    chat_code: str
     topic: str
     title: Optional[str] = None
     mode: DiscussionMode

@@ -14,6 +14,18 @@ const PROVIDER_PRESETS = [
   { label: 'Ollama', provider: 'ollama', models: ['llama3'] },
 ]
 
+function parseSummaryConfig(raw) {
+  if (!raw) return null
+  try {
+    let parsed = typeof raw === 'string' ? JSON.parse(raw) : raw
+    if (typeof parsed === 'string') parsed = JSON.parse(parsed)
+    if (!parsed || typeof parsed !== 'object') return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
 export default function SettingsPage() {
   const [providers, setProviders] = useState([])
   const [loading, setLoading] = useState(true)
@@ -41,9 +53,7 @@ export default function SettingsPage() {
     ])
       .then(([provs, setting]) => {
         setProviders(provs)
-        if (setting.value) {
-          try { setSummaryConfig(JSON.parse(setting.value)) } catch {}
-        }
+        setSummaryConfig(parseSummaryConfig(setting.value))
       })
       .catch(e => setError(e.message))
       .finally(() => setLoading(false))

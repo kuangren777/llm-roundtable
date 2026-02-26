@@ -22,7 +22,7 @@ async def _collect_sse_events(client, url: str) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_strict_n_rounds_then_incremental_followup_flow(client, monkeypatch):
+async def test_each_run_stops_after_round_summary(client, monkeypatch):
     async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
         if phase == "planning":
             return json.dumps({
@@ -78,19 +78,14 @@ async def test_strict_n_rounds_then_incremental_followup_flow(client, monkeypatc
         "discussing",
         "reflecting",
         "round_summary",
-        "next_step_planning",
-        "planning",
-        "discussing",
-        "reflecting",
-        "round_summary",
-        "next_step_planning",
-        "synthesizing",
     ]
-    assert any(e.get("event_type") == "complete" for e in first_events)
+    assert "next_step_planning" not in first_phases
+    assert "synthesizing" not in first_phases
+    assert any(e.get("event_type") == "cycle_complete" for e in first_events)
 
     detail_res = await client.get(f"/api/discussions/{discussion_id}")
     assert detail_res.status_code == 200
-    assert detail_res.json()["status"] == "completed"
+    assert detail_res.json()["status"] == "waiting_input"
 
     user_input_res = await client.post(
         f"/api/discussions/{discussion_id}/user-input",
@@ -107,9 +102,9 @@ async def test_strict_n_rounds_then_incremental_followup_flow(client, monkeypatc
         "planning",
         "planning",
         "discussing",
+        "reflecting",
         "round_summary",
     ]
-    assert "reflecting" not in second_phases
     assert "next_step_planning" not in second_phases
     assert "synthesizing" not in second_phases
     assert any(e.get("event_type") == "cycle_complete" for e in second_events)
@@ -172,15 +167,15 @@ async def test_running_without_local_task_recovers_to_resumable_run(client, monk
 
     assert called["reattach_called"] is False
     assert any(e.get("event_type") == "phase_change" and e.get("phase") == "planning" for e in events)
-    assert any(e.get("event_type") == "complete" for e in events)
+    assert any(e.get("event_type") == "cycle_complete" for e in events)
 
     detail_res = await client.get(f"/api/discussions/{discussion_id}")
     assert detail_res.status_code == 200
-    assert detail_res.json()["status"] == "completed"
+    assert detail_res.json()["status"] == "waiting_input"
 
 
 @pytest.mark.asyncio
-async def test_waiting_input_without_history_still_runs_full_n_rounds(client, monkeypatch):
+async def test_waiting_input_without_history_still_stops_after_round_summary(client, monkeypatch):
     async def fake_call(agent, messages, phase="", stream_content=False, **kwargs):
         if phase == "planning":
             return json.dumps({
@@ -242,13 +237,7 @@ async def test_waiting_input_without_history_still_runs_full_n_rounds(client, mo
         "discussing",
         "reflecting",
         "round_summary",
-        "next_step_planning",
-        "planning",
-        "discussing",
-        "reflecting",
-        "round_summary",
-        "next_step_planning",
-        "synthesizing",
     ]
-    assert any(e.get("event_type") == "complete" for e in events)
-    assert not any(e.get("event_type") == "cycle_complete" for e in events)
+    assert "next_step_planning" not in phases
+    assert "synthesizing" not in phases
+    assert any(e.get("event_type") == "cycle_complete" for e in events)

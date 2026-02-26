@@ -37,14 +37,19 @@ import {
   Download,
   Pencil,
   Check,
+  Share2,
+  Link2,
+  LogOut,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, SummaryEvent, MessageResponse, AgentConfigResponse, LLMProviderResponse, ObserverMessageResponse } from './types';
+import type { DiscussionResponse, DiscussionDetail, DiscussionEvent, SummaryEvent, MessageResponse, AgentConfigResponse, LLMProviderResponse, ObserverMessageResponse, UserResponse } from './types';
 import {
-  listDiscussions, getDiscussion, deleteDiscussion, stopDiscussion, resetDiscussion,
+  listDiscussions, getDiscussion, getDiscussionByCode, getSharedDiscussion, deleteDiscussion, stopDiscussion, resetDiscussion,
   prepareAgents, generateTitle, submitUserInput, deleteMessage, updateMessage, updateTopic,
   truncateMessagesAfter, streamDiscussion, streamSummarize, streamObserverChat,
-  listLLMProviders, getObserverHistory, clearObserverHistory,
+  listLLMProviders, getObserverHistory, clearObserverHistory, updateObserverMessage, truncateObserverMessagesAfter,
+  createDiscussionShare, revokeDiscussionShare, getDiscussionShare,
+  register as registerUser, login as loginUser, logout as logoutUser, me as meApi,
 } from './services/api';
 import { SettingsModal } from './components/SettingsModal';
 import { NewDebateModal } from './components/NewDebateModal';
@@ -130,6 +135,16 @@ function normalizeMarkdown(content: string) {
     normalized.push(line);
   }
   return normalized.join('\n');
+}
+
+function extractChatCode(pathname: string): string | null {
+  const m = pathname.match(/^\/chat\/([A-Za-z0-9]{16})\/?$/);
+  return m ? m[1] : null;
+}
+
+function extractShareCode(pathname: string): string | null {
+  const m = pathname.match(/^\/share\/([A-Za-z0-9]{16})\/?$/);
+  return m ? m[1] : null;
 }
 
 let mermaidScriptPromise: Promise<void> | null = null;
@@ -406,10 +421,20 @@ const SummaryModal = ({ isOpen, onClose, content, title, onDownload, onCopy }: {
 };
 
 export default function App() {
+  const [routePath, setRoutePath] = useState<string>(typeof window !== 'undefined' ? window.location.pathname : '/');
+  const [currentUser, setCurrentUser] = useState<UserResponse | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+
   // Discussion list
   const [discussions, setDiscussions] = useState<DiscussionResponse[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [detail, setDetail] = useState<DiscussionDetail | null>(null);
+  const [sharedDetail, setSharedDetail] = useState<DiscussionDetail | null>(null);
+  const [sharedLoading, setSharedLoading] = useState(false);
+  const [shareCode, setShareCode] = useState<string | null>(null);
 
   // Discussion state
   const [messages, setMessages] = useState<MessageResponse[]>([]);
@@ -453,6 +478,8 @@ export default function App() {
   const [observerStreaming, setObserverStreaming] = useState(false);
   const [observerStreamText, setObserverStreamText] = useState('');
   const [observerConfig, setObserverConfig] = useState<{ providerId: number | null; provider: string; model: string }>({ providerId: null, provider: '', model: '' });
+  const [editingObserverMsgId, setEditingObserverMsgId] = useState<number | null>(null);
+  const [editingObserverContent, setEditingObserverContent] = useState('');
   const observerStreamRef = useRef<AbortController | null>(null);
   const observerTextRef = useRef('');
 
@@ -468,6 +495,17 @@ export default function App() {
   const summarizeAutoBlockUntilRef = useRef(0);
   const summarizeRunningCooldownRef = useRef(0);
   const toastTimerRef = useRef<number | null>(null);
+  const chatCodeFromRoute = useMemo(() => extractChatCode(routePath), [routePath]);
+  const shareCodeFromRoute = useMemo(() => extractShareCode(routePath), [routePath]);
+  const isLoginRoute = routePath === '/login';
+  const isRegisterRoute = routePath === '/register';
+
+  const navigatePath = useCallback((path: string, replace = false) => {
+    if (typeof window === 'undefined') return;
+    if (replace) window.history.replaceState({}, '', path);
+    else window.history.pushState({}, '', path);
+    setRoutePath(path);
+  }, []);
 
   const persistLiveState = useCallback((id: number, patch: Partial<LiveState>) => {
     const prev = liveStateRef.current[id] || {
@@ -491,6 +529,12 @@ export default function App() {
     clearLiveState(id);
   }, []);
 
+  useEffect(() => {
+    const onPopState = () => setRoutePath(window.location.pathname);
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
   // Resize handler for observer panel
   useEffect(() => {
     if (!isResizing) return;
@@ -504,12 +548,99 @@ export default function App() {
     return () => { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); };
   }, [isResizing]);
 
-  // Load discussion list on mount
-  const refreshList = useCallback(async () => {
-    try { setDiscussions(await listDiscussions()); } catch {}
+  // Auth bootstrap
+  useEffect(() => {
+    setAuthLoading(true);
+    meApi()
+      .then((res) => {
+        setCurrentUser(res.user);
+      })
+      .catch(() => {
+        setCurrentUser(null);
+      })
+      .finally(() => setAuthLoading(false));
   }, []);
 
+  // Public share route (no login required)
+  useEffect(() => {
+    if (!shareCodeFromRoute) {
+      setSharedDetail(null);
+      setSharedLoading(false);
+      return;
+    }
+    setSharedLoading(true);
+    getSharedDiscussion(shareCodeFromRoute)
+      .then((d) => {
+        setSharedDetail(d);
+        setError(null);
+      })
+      .catch((e: unknown) => {
+        setSharedDetail(null);
+        setError(e instanceof Error ? e.message : 'Failed to load shared chat');
+      })
+      .finally(() => setSharedLoading(false));
+  }, [shareCodeFromRoute]);
+
+  useEffect(() => {
+    if (shareCodeFromRoute) return;
+    if (authLoading) return;
+    if (!currentUser) {
+      if (!isLoginRoute && !isRegisterRoute) navigatePath('/login', true);
+      return;
+    }
+    if (isLoginRoute || isRegisterRoute || routePath === '/') {
+      navigatePath('/', true);
+    }
+  }, [shareCodeFromRoute, authLoading, currentUser, isLoginRoute, isRegisterRoute, routePath, navigatePath]);
+
+  // Load discussion list after auth
+  const refreshList = useCallback(async () => {
+    if (!currentUser) {
+      setDiscussions([]);
+      return;
+    }
+    try {
+      setDiscussions(await listDiscussions());
+    } catch {}
+  }, [currentUser]);
+
   useEffect(() => { refreshList(); }, [refreshList]);
+
+  useEffect(() => {
+    if (!currentUser || authLoading || shareCodeFromRoute) return;
+    if (chatCodeFromRoute) {
+      const hit = discussions.find((d) => d.chat_code === chatCodeFromRoute);
+      if (hit) {
+        if (activeId !== hit.id) setActiveId(hit.id);
+      } else {
+        getDiscussionByCode(chatCodeFromRoute)
+          .then((d) => {
+            setDiscussions((prev) => {
+              if (prev.some((p) => p.id === d.id)) return prev;
+              return [d, ...prev];
+            });
+            setActiveId(d.id);
+          })
+          .catch(() => {
+            setError('Chat not found');
+          });
+      }
+      return;
+    }
+
+    if (routePath === '/' && discussions.length > 0) {
+      navigatePath(`/chat/${discussions[0].chat_code}`, true);
+    }
+  }, [
+    currentUser,
+    authLoading,
+    shareCodeFromRoute,
+    chatCodeFromRoute,
+    discussions,
+    activeId,
+    routePath,
+    navigatePath,
+  ]);
 
   // Load providers
   useEffect(() => {
@@ -569,6 +700,10 @@ export default function App() {
 
   // Load discussion detail when activeId changes
   useEffect(() => {
+    if (!currentUser || shareCodeFromRoute) {
+      setDiscStatus('loading');
+      return;
+    }
     streamRef.current?.abort();
     streamRef.current = null;
     summaryStreamRef.current?.abort();
@@ -582,8 +717,11 @@ export default function App() {
     setSummaryProgress('');
     setSummarizingMsgId(null);
     setStreamingSummaries({});
+    setEditingObserverMsgId(null);
+    setEditingObserverContent('');
     if (!activeId) {
       setDetail(null);
+      setShareCode(null);
       setMessages([]);
       setAgents([]);
       setDiscStatus('loading');
@@ -603,11 +741,13 @@ export default function App() {
       setStreamingSummaries({});
       setPhase('');
       try {
-        const [d, obsHistory] = await Promise.all([
+        const [d, obsHistory, shareInfo] = await Promise.all([
           getDiscussion(activeId),
           getObserverHistory(activeId).catch(() => []),
+          getDiscussionShare(activeId).catch(() => ({ active: false, share_code: null })),
         ]);
         setDetail(d);
+        setShareCode(shareInfo.active ? shareInfo.share_code : null);
         setMessages(d.messages || []);
         setAgents(d.agents || []);
         setObserverMessages(obsHistory as ObserverMessageResponse[]);
@@ -659,7 +799,7 @@ export default function App() {
       summaryStreamRef.current = null;
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     };
-  }, [activeId, startPolling, removeLiveState]);
+  }, [activeId, startPolling, removeLiveState, currentUser, shareCodeFromRoute]);
 
   // --- Handlers ---
 
@@ -769,6 +909,8 @@ export default function App() {
         removeLiveState(activeId);
       },
       (evt: DiscussionEvent) => {
+        const terminalStatus = evt.event_type === 'complete' ? 'completed' : 'waiting_input';
+        setDiscStatus(terminalStatus);
         setLlmProgress(null);
         setStreamingContent({});
         streamRef.current = null;
@@ -777,7 +919,7 @@ export default function App() {
           setDetail(d);
           setMessages(d.messages || []);
           setAgents(d.agents || []);
-          setDiscStatus(evt.event_type === 'complete' ? 'completed' : 'waiting_input');
+          setDiscStatus(terminalStatus);
           refreshList();
         });
       },
@@ -867,8 +1009,11 @@ export default function App() {
   const handleDeleteDiscussion = useCallback(async (id: number) => {
     try { await deleteDiscussion(id); } catch {}
     setDiscussions(prev => prev.filter(d => d.id !== id));
-    if (activeId === id) setActiveId(null);
-  }, [activeId]);
+    if (activeId === id) {
+      setActiveId(null);
+      navigatePath('/', true);
+    }
+  }, [activeId, navigatePath]);
 
   const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
     const id = Date.now();
@@ -894,6 +1039,76 @@ export default function App() {
     const ok = await copyTextWithFallback(text);
     showToast(ok ? '已完成复制' : '复制失败，请检查浏览器权限', ok ? 'success' : 'error');
   }, [showToast]);
+
+  const handleAuthSubmit = useCallback(async (mode: 'login' | 'register') => {
+    if (!authEmail.trim() || !authPassword.trim()) return;
+    setAuthSubmitting(true);
+    try {
+      const fn = mode === 'register' ? registerUser : loginUser;
+      const res = await fn(authEmail.trim(), authPassword);
+      setCurrentUser(res.user);
+      setAuthPassword('');
+      setError(null);
+      navigatePath('/', true);
+      showToast(mode === 'register' ? '注册成功' : '登录成功');
+      await refreshList();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '认证失败');
+      showToast(mode === 'register' ? '注册失败' : '登录失败', 'error');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  }, [authEmail, authPassword, navigatePath, showToast, refreshList]);
+
+  const handleLogout = useCallback(async () => {
+    try { await logoutUser(); } catch {}
+    streamRef.current?.abort();
+    streamRef.current = null;
+    summaryStreamRef.current?.abort();
+    summaryStreamRef.current = null;
+    observerStreamRef.current?.abort();
+    observerStreamRef.current = null;
+    if (activeId) {
+      removeLiveState(activeId);
+    }
+    setCurrentUser(null);
+    setDiscussions([]);
+    setActiveId(null);
+    setDetail(null);
+    setShareCode(null);
+    setMessages([]);
+    setAgents([]);
+    setObserverMessages([]);
+    setStreamingContent({});
+    setLlmProgress(null);
+    navigatePath('/login', true);
+    showToast('已退出登录');
+  }, [activeId, navigatePath, removeLiveState, showToast]);
+
+  const handleCreateShare = useCallback(async () => {
+    if (!activeId) return;
+    try {
+      const res = await createDiscussionShare(activeId);
+      setShareCode(res.share_code);
+      const url = `${window.location.origin}/share/${res.share_code}`;
+      await copyToClipboard(url);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '创建分享失败');
+      showToast('创建分享失败', 'error');
+    }
+  }, [activeId, copyToClipboard, showToast]);
+
+  const handleRevokeShare = useCallback(async () => {
+    if (!activeId) return;
+    try {
+      await revokeDiscussionShare(activeId);
+      setShareCode(null);
+      showToast('已关闭分享');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '关闭分享失败');
+      showToast('关闭分享失败', 'error');
+    }
+  }, [activeId, showToast]);
 
   const openSummary = (content: string, title = 'Summary Details', downloadUrl = '') => {
     setSummaryContent(content); setSummaryTitle(title); setSummaryDownloadUrl(downloadUrl); setSummaryModalOpen(true);
@@ -1069,12 +1284,15 @@ export default function App() {
   }, [activeId, summarizing]);
 
   // Observer chat
-  const handleObserverSend = useCallback(async () => {
-    const text = observerInput.trim();
-    if (!text || observerStreaming) return;
+  const sendObserverMessage = useCallback(async (
+    rawText: string,
+    options?: { optimisticUserAppend?: boolean; reuseMessageId?: number },
+  ) => {
+    const text = rawText.trim();
+    if (!text || observerStreaming) return false;
     if (!activeId) {
       setError('No active discussion selected for observer chat');
-      return;
+      return false;
     }
     const selected = providers.find(p => p.id === observerConfig.providerId);
     const resolvedProvider = observerConfig.provider || selected?.provider || '';
@@ -1082,39 +1300,107 @@ export default function App() {
     const resolvedProviderId = observerConfig.providerId ?? selected?.id ?? null;
     if (!resolvedProvider || !resolvedModel) {
       setError('Observer model is not configured. Please choose a provider/model first.');
-      return;
+      return false;
     }
-    const userMsg: ObserverMessageResponse = { id: Date.now(), role: 'user', content: text, created_at: new Date().toISOString() };
-    setObserverMessages(prev => [...prev, userMsg]);
+
+    if (options?.optimisticUserAppend !== false) {
+      const userMsg: ObserverMessageResponse = {
+        id: Date.now(),
+        role: 'user',
+        content: text,
+        created_at: new Date().toISOString(),
+      };
+      setObserverMessages(prev => [...prev, userMsg]);
+    }
+
     setObserverInput('');
     setObserverStreaming(true);
     setObserverStreamText('');
-    setObserverConfig(prev => ({
+    setObserverConfig({
       providerId: resolvedProviderId,
       provider: resolvedProvider,
       model: resolvedModel,
-    }));
+    });
     observerTextRef.current = '';
+
+    const discussionId = activeId;
     const ctrl = streamObserverChat(
-      activeId,
-      { content: text, provider: resolvedProvider, model: resolvedModel, provider_id: resolvedProviderId ?? undefined },
-      (chunk) => { observerTextRef.current += chunk; setObserverStreamText(prev => prev + chunk); },
-      (err) => { setObserverStreamText(prev => prev + `\n[Error: ${err}]`); setObserverStreaming(false); },
+      discussionId,
+      {
+        content: text,
+        provider: resolvedProvider,
+        model: resolvedModel,
+        provider_id: resolvedProviderId ?? undefined,
+        reuse_message_id: options?.reuseMessageId,
+      },
+      (chunk) => {
+        observerTextRef.current += chunk;
+        setObserverStreamText(prev => prev + chunk);
+      },
+      (err) => {
+        setObserverStreamText(prev => prev + `\n[Error: ${err}]`);
+        setObserverStreaming(false);
+        void getObserverHistory(discussionId)
+          .then(history => setObserverMessages(history as ObserverMessageResponse[]))
+          .catch(() => {});
+      },
       () => {
-        const text = observerTextRef.current;
-        if (text) setObserverMessages(msgs => [...msgs, { id: Date.now() + 1, role: 'observer', content: text, created_at: new Date().toISOString() }]);
         setObserverStreamText('');
         setObserverStreaming(false);
+        void getObserverHistory(discussionId)
+          .then(history => setObserverMessages(history as ObserverMessageResponse[]))
+          .catch(() => {});
       },
     );
     observerStreamRef.current = ctrl;
-  }, [activeId, observerInput, observerStreaming, observerConfig, providers]);
+    return true;
+  }, [activeId, observerStreaming, observerConfig, providers]);
+
+  const handleObserverSend = useCallback(async () => {
+    await sendObserverMessage(observerInput, { optimisticUserAppend: true });
+  }, [observerInput, sendObserverMessage]);
 
   const handleObserverClear = useCallback(async () => {
     if (observerStreaming) { observerStreamRef.current?.abort(); setObserverStreaming(false); setObserverStreamText(''); }
     if (activeId) try { await clearObserverHistory(activeId); } catch {}
     setObserverMessages([]);
+    setEditingObserverMsgId(null);
+    setEditingObserverContent('');
   }, [activeId, observerStreaming]);
+
+  const handleObserverSaveEdited = useCallback(async (msg: ObserverMessageResponse) => {
+    if (!activeId) return;
+    if (observerStreaming) {
+      showToast('Observer 正在回复，请稍后再编辑', 'error');
+      return;
+    }
+    if (msg.role !== 'user') return;
+
+    const nextText = editingObserverContent.trim();
+    if (!nextText || nextText === msg.content) {
+      setEditingObserverMsgId(null);
+      setEditingObserverContent('');
+      return;
+    }
+
+    try {
+      await updateObserverMessage(activeId, msg.id, nextText);
+      const { deleted_count } = await truncateObserverMessagesAfter(activeId, msg.id);
+      const history = await getObserverHistory(activeId);
+      setObserverMessages(history as ObserverMessageResponse[]);
+      setEditingObserverMsgId(null);
+      setEditingObserverContent('');
+      showToast(
+        deleted_count > 0
+          ? `已删除后续 ${deleted_count} 条消息，正在重发`
+          : '消息已更新，正在重发',
+      );
+      await sendObserverMessage(nextText, { optimisticUserAppend: false, reuseMessageId: msg.id });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Observer 消息编辑失败');
+      showToast('Observer 消息编辑失败', 'error');
+    }
+  }, [activeId, observerStreaming, editingObserverContent, showToast, sendObserverMessage]);
 
   const selectedProviderObj = providers.find(p => p.id === observerConfig.providerId);
   const observerModels = selectedProviderObj?.models || [];
@@ -1183,11 +1469,10 @@ export default function App() {
 
       showToast(
         followingDisplayCount > 0
-          ? `已删除后续 ${followingDisplayCount} 条消息，${(detail?.status === 'completed') ? '正在补跑一轮' : '按原轮次继续讨论'}`
-          : ((detail?.status === 'completed') ? '修改已保存，正在补跑一轮' : '修改已保存，按原轮次继续讨论'),
+          ? `已删除后续 ${followingDisplayCount} 条消息，正在继续讨论`
+          : '修改已保存，正在继续讨论',
       );
-      const shouldRunSingleRound = detail?.status === 'completed';
-      startDiscussionStream({ singleRound: shouldRunSingleRound });
+      startDiscussionStream();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '修改失败');
       showToast('修改失败', 'error');
@@ -1271,6 +1556,100 @@ export default function App() {
       };
     });
 
+  if (shareCodeFromRoute) {
+    if (sharedLoading) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-600">
+          Loading shared chat...
+        </div>
+      );
+    }
+    if (!sharedDetail) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-600">
+          Shared chat not found.
+        </div>
+      );
+    }
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-800">
+        <div className="max-w-4xl mx-auto px-6 py-8">
+          <div className="mb-6">
+            <h1 className="text-2xl font-bold">{sharedDetail.title || sharedDetail.topic}</h1>
+            <p className="text-sm text-slate-500 mt-1">Read-only shared chat</p>
+          </div>
+          <div className="space-y-4">
+            {(sharedDetail.messages || []).map((msg) => (
+              <div key={msg.id} className="bg-white rounded-xl border border-slate-200 p-4">
+                <div className="text-xs text-slate-500 mb-2">
+                  {msg.agent_name} · {PHASE_LABELS[msg.phase || ''] || msg.phase || '-'} · {formatTime(msg.created_at)}
+                </div>
+                <MarkdownRenderer content={msg.content} />
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (authLoading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 text-slate-600">
+        Checking session...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    const isRegister = isRegisterRoute;
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-50 px-4">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
+          <h1 className="text-xl font-bold text-slate-900">{isRegister ? 'Register' : 'Login'}</h1>
+          <p className="text-sm text-slate-500 mt-1">
+            {isRegister ? 'Create your account to access your chats.' : 'Sign in to access your chats.'}
+          </p>
+          <div className="mt-5 space-y-3">
+            <input
+              type="email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              placeholder="Email"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Password (min 8 chars)"
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+            />
+            <button
+              onClick={() => { void handleAuthSubmit(isRegister ? 'register' : 'login'); }}
+              disabled={authSubmitting || !authEmail.trim() || authPassword.length < 8}
+              className="w-full rounded-lg bg-slate-900 text-white py-2 text-sm disabled:opacity-50"
+            >
+              {authSubmitting ? 'Submitting...' : (isRegister ? 'Register' : 'Login')}
+            </button>
+          </div>
+          <div className="mt-4 text-sm text-slate-600">
+            {isRegister ? (
+              <button className="text-blue-600 hover:underline" onClick={() => navigatePath('/login')}>
+                Already have an account? Login
+              </button>
+            ) : (
+              <button className="text-blue-600 hover:underline" onClick={() => navigatePath('/register')}>
+                No account? Register
+              </button>
+            )}
+          </div>
+          {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen w-full overflow-hidden font-sans">
       <SummaryModal isOpen={summaryModalOpen} onClose={() => { setSummaryModalOpen(false); setSummaryDownloadUrl(''); }} content={summaryContent} title={summaryTitle}
@@ -1278,7 +1657,11 @@ export default function App() {
         onCopy={copyToClipboard}
       />
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} onProvidersChange={() => listLLMProviders().then(setProviders).catch(() => {})} />
-      <NewDebateModal isOpen={newDebateOpen} onClose={() => setNewDebateOpen(false)} onCreated={(d) => { refreshList(); setActiveId(d.id); }} />
+      <NewDebateModal isOpen={newDebateOpen} onClose={() => setNewDebateOpen(false)} onCreated={(d) => {
+        refreshList();
+        setActiveId(d.id);
+        navigatePath(`/chat/${d.chat_code}`);
+      }} />
       <AgentConfigModal
         isOpen={!!editingAgent}
         onClose={() => setEditingAgent(null)}
@@ -1334,7 +1717,7 @@ export default function App() {
         <div className="flex-1 overflow-y-auto px-3 space-y-1 pb-4">
           <div className="text-[10px] font-bold text-slate-500 dark:text-slate-400 px-3 mb-2 uppercase tracking-widest">Active</div>
           {discussions.filter(d => RUNNING_STATUSES.includes(d.status) || d.status === 'created' || d.status === 'waiting_input').map(disc => (
-            <div key={disc.id} onClick={() => setActiveId(disc.id)}
+            <div key={disc.id} onClick={() => { setActiveId(disc.id); navigatePath(`/chat/${disc.chat_code}`); }}
               className={`group flex flex-col p-3.5 rounded-xl cursor-pointer relative overflow-hidden transition-all duration-200 ${
                 activeId === disc.id ? 'bg-white/50 dark:bg-white/5 border border-violet-200/50 dark:border-white/10 shadow-sm' : 'hover:bg-white/30 dark:hover:bg-white/5 border border-transparent'
               }`}>
@@ -1357,7 +1740,7 @@ export default function App() {
 
           <div className="mt-6 text-[10px] font-bold text-slate-500 dark:text-slate-400 px-3 mb-2 uppercase tracking-widest pt-4">History</div>
           {discussions.filter(d => d.status === 'completed' || d.status === 'failed').map(disc => (
-            <div key={disc.id} onClick={() => setActiveId(disc.id)}
+            <div key={disc.id} onClick={() => { setActiveId(disc.id); navigatePath(`/chat/${disc.chat_code}`); }}
               className={`group flex flex-col p-3 rounded-xl hover:bg-white/40 dark:hover:bg-white/5 border border-transparent hover:border-white/20 cursor-pointer transition-all ${
                 activeId === disc.id ? 'bg-white/40 dark:bg-white/5 border-white/20' : ''
               }`}>
@@ -1374,9 +1757,10 @@ export default function App() {
           ))}
         </div>
 
-        <div className="p-4 border-t border-slate-200/40 dark:border-slate-700/40 mt-auto bg-white/10 dark:bg-black/10 backdrop-blur-sm">
+        <div className="p-4 border-t border-slate-200/40 dark:border-slate-700/40 mt-auto bg-white/10 dark:bg-black/10 backdrop-blur-sm space-y-2">
+          <div className="text-[11px] text-slate-500 dark:text-slate-400 truncate px-1">{currentUser.email}</div>
           <button onClick={() => setSettingsOpen(true)}
-            className="flex items-center justify-between text-slate-600 dark:text-slate-400 hover:text-violet-600 dark:hover:text-violet-400 transition w-full group">
+            className="flex items-center justify-between text-slate-600 dark:text-slate-400 hover:text-violet-600 dark:hover:text-violet-400 transition w-full group px-1">
             <div className="flex items-center space-x-3">
               <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-slate-200 to-slate-100 dark:from-slate-700 dark:to-slate-600 flex items-center justify-center">
                 <UserIcon className="w-4 h-4" />
@@ -1384,6 +1768,13 @@ export default function App() {
               <span className="text-sm font-medium">Settings</span>
             </div>
             <SettingsIcon className="w-4 h-4 opacity-0 group-hover:opacity-100 transition-opacity" />
+          </button>
+          <button
+            onClick={() => { void handleLogout(); }}
+            className="flex items-center gap-2 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-300 transition w-full text-sm font-medium px-1"
+          >
+            <LogOut className="w-4 h-4" />
+            Logout
           </button>
         </div>
         </div>
@@ -1427,6 +1818,16 @@ export default function App() {
               <Eye className="w-4 h-4" /><span className="text-sm font-medium">Observer</span>
             </button>
             {detail && (
+              <button
+                onClick={() => { void (shareCode ? copyToClipboard(`${window.location.origin}/share/${shareCode}`) : handleCreateShare()); }}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800 transition-all"
+                title={shareCode ? 'Copy share link' : 'Create share link'}
+              >
+                <Share2 className="w-4 h-4" />
+                <span className="text-sm font-medium">{shareCode ? 'Copy Share' : 'Share'}</span>
+              </button>
+            )}
+            {detail && (
               <div className="relative">
                 <button onClick={() => setShowHeaderMenu(!showHeaderMenu)}
                   className="text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-200 transition">
@@ -1447,6 +1848,47 @@ export default function App() {
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2">
                       <Download className="w-3.5 h-3.5" /> Download Conversation
                     </button>
+                    {shareCode ? (
+                      <>
+                        <button
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            void copyToClipboard(`${window.location.origin}/share/${shareCode}`);
+                          }}
+                          className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+                        >
+                          <Link2 className="w-3.5 h-3.5" /> Copy Share Link
+                        </button>
+                        <button
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            window.open(`/share/${shareCode}`, '_blank', 'noopener,noreferrer');
+                          }}
+                          className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+                        >
+                          <Eye className="w-3.5 h-3.5" /> Open Shared View
+                        </button>
+                        <button
+                          onClick={() => {
+                            setShowHeaderMenu(false);
+                            void handleRevokeShare();
+                          }}
+                          className="w-full text-left px-4 py-2 text-sm text-red-600 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-900/20 flex items-center gap-2"
+                        >
+                          <Share2 className="w-3.5 h-3.5" /> Revoke Share
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={() => {
+                          setShowHeaderMenu(false);
+                          void handleCreateShare();
+                        }}
+                        className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 flex items-center gap-2"
+                      >
+                        <Share2 className="w-3.5 h-3.5" /> Create Share Link
+                      </button>
+                    )}
                     <div className="h-px bg-slate-200 dark:bg-slate-700 my-1" />
                     <button onClick={() => { setShowHeaderMenu(false); if (activeId) generateTitle(activeId).then(() => refreshList()); }}
                       className="w-full text-left px-4 py-2 text-sm text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700">
@@ -1809,8 +2251,55 @@ export default function App() {
                 {msg.created_at && <span className="text-[10px] text-slate-400">{formatTime(msg.created_at)}</span>}
               </div>
               <div className="relative glass-card rounded-xl rounded-tl-none p-3 shadow-sm border border-slate-200/50 dark:border-slate-700/50">
-                <MarkdownRenderer content={msg.content} />
+                {editingObserverMsgId === msg.id ? (
+                  <div className="space-y-2">
+                    <textarea
+                      value={editingObserverContent}
+                      onChange={(e) => setEditingObserverContent(e.target.value)}
+                      onKeyDown={(e) => {
+                        if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                          e.preventDefault();
+                          void handleObserverSaveEdited(msg);
+                        }
+                      }}
+                      className="w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-xs text-slate-700 dark:text-slate-200 p-2 focus:outline-none focus:ring-2 focus:ring-violet-500/30"
+                      rows={4}
+                    />
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        onClick={() => { setEditingObserverMsgId(null); setEditingObserverContent(''); }}
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700 transition"
+                        title="Cancel"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => { void handleObserverSaveEdited(msg); }}
+                        className="p-1.5 rounded-lg text-emerald-500 hover:text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition"
+                        title="Save and resend"
+                      >
+                        <Check className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <MarkdownRenderer content={msg.content} />
+                )}
                 <div className="absolute -bottom-2 right-2 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
+                  {msg.role === 'user' && (
+                    <button
+                      onClick={() => {
+                        if (observerStreaming) return;
+                        setEditingObserverMsgId(msg.id);
+                        setEditingObserverContent(msg.content);
+                      }}
+                      className="p-1 bg-white dark:bg-slate-700 rounded-full shadow-sm text-slate-400 hover:text-emerald-500 hover:scale-110 transition disabled:opacity-50"
+                      title="Edit and resend"
+                      disabled={observerStreaming}
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                  )}
                   <button onClick={() => { void copyToClipboard(msg.content); }}
                     className="p-1 bg-white dark:bg-slate-700 rounded-full shadow-sm text-slate-400 hover:text-blue-500 hover:scale-110 transition" title="Copy">
                     <Copy className="w-3 h-3" />

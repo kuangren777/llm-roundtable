@@ -1,11 +1,72 @@
 """Tests for FastAPI API endpoints using httpx AsyncClient."""
 import json
+from httpx import AsyncClient, ASGITransport
+
+from backend.app.main import app
 
 
 async def test_health_check(client):
     res = await client.get("/api/health")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+async def test_auth_me_and_logout(client):
+    me_res = await client.get("/api/auth/me")
+    assert me_res.status_code == 200
+    assert me_res.json()["user"]["email"] == "tester@example.com"
+
+    logout_res = await client.post("/api/auth/logout")
+    assert logout_res.status_code == 200
+    assert logout_res.json()["ok"] is True
+
+    me_after = await client.get("/api/auth/me")
+    assert me_after.status_code == 401
+
+
+async def test_discussions_isolated_by_user_and_share_read_only(client):
+    create_res = await client.post(
+        "/api/discussions/",
+        json={"topic": "Private discussion", "mode": "debate"},
+    )
+    assert create_res.status_code == 200
+    discussion = create_res.json()
+    discussion_id = discussion["id"]
+    chat_code = discussion["chat_code"]
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as user2:
+        reg_res = await user2.post(
+            "/api/auth/register",
+            json={"email": "user2@example.com", "password": "User2Pass123!"},
+        )
+        assert reg_res.status_code == 200
+
+        list_res = await user2.get("/api/discussions/")
+        assert list_res.status_code == 200
+        assert list_res.json() == []
+
+        detail_res = await user2.get(f"/api/discussions/{discussion_id}")
+        assert detail_res.status_code == 404
+
+        by_code_res = await user2.get(f"/api/discussions/by-code/{chat_code}")
+        assert by_code_res.status_code == 404
+
+    share_res = await client.post(f"/api/discussions/{discussion_id}/share")
+    assert share_res.status_code == 200
+    share_code = share_res.json()["share_code"]
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as user2:
+        reg_res = await user2.post(
+            "/api/auth/register",
+            json={"email": "user2b@example.com", "password": "User2Pass123!"},
+        )
+        assert reg_res.status_code == 200
+
+        shared_res = await user2.get(f"/api/share/{share_code}")
+        assert shared_res.status_code == 200
+        assert shared_res.json()["id"] == discussion_id
 
 
 async def test_create_discussion(client):
@@ -354,7 +415,7 @@ async def test_discussion_snapshots_provider_models(client):
     assert detail.json()["mode"] == "debate"
 
 
-async def test_user_input_cycle_index_increments_after_completion(client):
+async def test_user_input_round_monotonic_and_cycle_index_stable(client):
     create_res = await client.post("/api/discussions/", json={"topic": "Cycle test", "mode": "debate"})
     disc_id = create_res.json()["id"]
 
@@ -378,7 +439,8 @@ async def test_user_input_cycle_index_increments_after_completion(client):
     assert user_msgs[1]["content"] == "第一条输入"
     assert user_msgs[1]["cycle_index"] == 0
     assert user_msgs[2]["content"] == "第二条输入"
-    assert user_msgs[2]["cycle_index"] == 1
+    assert user_msgs[2]["cycle_index"] == 0
+    assert user_msgs[0]["round_number"] <= user_msgs[1]["round_number"] <= user_msgs[2]["round_number"]
 
 
 async def test_truncate_after_message_deletes_following_messages(client):
@@ -518,6 +580,85 @@ async def test_observer_history_in_discussion_detail(client):
     assert "observer_messages" in data
     assert data["observer_messages"] == []
 
+
+async def test_observer_edit_and_resend_without_duplicate_user_message(client, monkeypatch):
+    """Observer user message should support edit + truncate + resend (reuse existing message)."""
+    create_res = await client.post("/api/discussions/", json={"topic": "Observer edit", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    async def fake_call_llm_stream_v1(*args, on_chunk=None, **kwargs):
+        if on_chunk:
+            await on_chunk("第一版回答", 5)
+        return "第一版回答", 5
+
+    monkeypatch.setattr("backend.app.services.observer_service.call_llm_stream", fake_call_llm_stream_v1)
+
+    first_chat = await client.post(
+        f"/api/discussions/{disc_id}/observer/chat",
+        json={"content": "原始问题", "provider": "openai", "model": "gpt-4o"},
+    )
+    assert first_chat.status_code == 200
+    assert "done" in first_chat.text
+
+    history_res = await client.get(f"/api/discussions/{disc_id}/observer/history")
+    assert history_res.status_code == 200
+    history = history_res.json()
+    assert len(history) == 2
+    user_msg = next(m for m in history if m["role"] == "user")
+
+    edit_res = await client.put(
+        f"/api/discussions/{disc_id}/observer/messages/{user_msg['id']}",
+        json={"content": "修改后的问题"},
+    )
+    assert edit_res.status_code == 200
+    assert edit_res.json()["content"] == "修改后的问题"
+
+    truncate_res = await client.post(
+        f"/api/discussions/{disc_id}/observer/messages/truncate-after",
+        json={"message_id": user_msg["id"]},
+    )
+    assert truncate_res.status_code == 200
+    assert truncate_res.json()["deleted_count"] == 1
+
+    async def fake_call_llm_stream_v2(*args, on_chunk=None, **kwargs):
+        if on_chunk:
+            await on_chunk("第二版回答", 5)
+        return "第二版回答", 5
+
+    monkeypatch.setattr("backend.app.services.observer_service.call_llm_stream", fake_call_llm_stream_v2)
+
+    resend_res = await client.post(
+        f"/api/discussions/{disc_id}/observer/chat",
+        json={
+            "content": "这段会被忽略",
+            "provider": "openai",
+            "model": "gpt-4o",
+            "reuse_message_id": user_msg["id"],
+        },
+    )
+    assert resend_res.status_code == 200
+    assert "done" in resend_res.text
+
+    final_history_res = await client.get(f"/api/discussions/{disc_id}/observer/history")
+    assert final_history_res.status_code == 200
+    final_history = final_history_res.json()
+    assert len(final_history) == 2
+    assert sum(1 for m in final_history if m["role"] == "user") == 1
+    assert final_history[0]["role"] == "user"
+    assert final_history[0]["content"] == "修改后的问题"
+    assert final_history[1]["role"] == "observer"
+    assert "第二版回答" in final_history[1]["content"]
+
+
+async def test_observer_edit_message_not_found(client):
+    create_res = await client.post("/api/discussions/", json={"topic": "Observer missing", "mode": "debate"})
+    disc_id = create_res.json()["id"]
+
+    res = await client.put(
+        f"/api/discussions/{disc_id}/observer/messages/99999",
+        json={"content": "new"},
+    )
+    assert res.status_code == 404
 
 async def test_summarize_stream_supports_double_encoded_summary_model_setting(client, monkeypatch):
     """Regression: summary_model may be stored as a double-encoded JSON string."""

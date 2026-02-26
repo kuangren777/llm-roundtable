@@ -1027,17 +1027,13 @@ def route_after_host_planning(state: DiscussionState) -> str:
 
 
 def route_after_panelist_discussion(state: DiscussionState) -> str:
-    """Incremental follow-up skips critic; full rounds include critic."""
-    if state.get("single_round_mode"):
-        return "round_summary"
+    """Critic review is always required after panelist discussion."""
     return "critic"
 
 
 def route_after_round_summary(state: DiscussionState) -> str:
-    """Incremental follow-up stops after summary; full rounds continue to next-step planning."""
-    if state.get("single_round_mode"):
-        return "stop"
-    return "next_step"
+    """Always stop after round summary and wait for user input."""
+    return "stop"
 
 
 async def increment_round(state: DiscussionState) -> dict:
@@ -1148,7 +1144,6 @@ def build_discussion_graph() -> StateGraph:
         route_after_panelist_discussion,
         {
             "critic": "critic_review",
-            "round_summary": "host_round_summary",
         },
     )
     graph.add_edge("critic_review", "host_round_summary")

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum as SAEnum, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum as SAEnum, JSON, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 import enum
@@ -32,10 +32,27 @@ class AgentRole(str, enum.Enum):
     USER = "user"
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    is_admin = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    discussions = relationship("Discussion", back_populates="owner")
+    created_shares = relationship("DiscussionShare", back_populates="created_by")
+
+
 class Discussion(Base):
     __tablename__ = "discussions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_code = Column(String(16), nullable=False, unique=True, index=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     topic = Column(Text, nullable=False)
     mode = Column(SAEnum(DiscussionMode), default=DiscussionMode.AUTO, nullable=False)
     status = Column(SAEnum(DiscussionStatus), default=DiscussionStatus.CREATED, nullable=False)
@@ -47,10 +64,12 @@ class Discussion(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
+    owner = relationship("User", back_populates="discussions")
     agents = relationship("AgentConfig", back_populates="discussion", cascade="all, delete-orphan")
     messages = relationship("Message", back_populates="discussion", cascade="all, delete-orphan", order_by="Message.created_at")
     materials = relationship("DiscussionMaterial", back_populates="discussion", cascade="all, delete-orphan")
     observer_messages = relationship("ObserverMessage", back_populates="discussion", cascade="all, delete-orphan", order_by="ObserverMessage.created_at")
+    shares = relationship("DiscussionShare", back_populates="discussion", cascade="all, delete-orphan")
 
 
 class AgentConfig(Base):
@@ -148,3 +167,18 @@ class ObserverMessage(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     discussion = relationship("Discussion", back_populates="observer_messages")
+
+
+class DiscussionShare(Base):
+    __tablename__ = "discussion_shares"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    discussion_id = Column(Integer, ForeignKey("discussions.id"), nullable=False, index=True)
+    share_code = Column(String(16), nullable=False, unique=True, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    discussion = relationship("Discussion", back_populates="shares")
+    created_by = relationship("User", back_populates="created_shares")

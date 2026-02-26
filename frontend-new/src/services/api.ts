@@ -9,18 +9,25 @@ import type {
   SystemSettingResponse,
   AgentConfigResponse,
   MessageResponse,
+  AuthStatusResponse,
 } from '../types';
 
 const API_BASE = '/api';
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${url}`, init);
+  const res = await fetch(`${API_BASE}${url}`, {
+    credentials: 'include',
+    ...init,
+  });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
 
 async function requestVoid(url: string, init?: RequestInit): Promise<void> {
-  const res = await fetch(`${API_BASE}${url}`, init);
+  const res = await fetch(`${API_BASE}${url}`, {
+    credentials: 'include',
+    ...init,
+  });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 }
 
@@ -31,6 +38,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 export const listDiscussions = () => request<DiscussionResponse[]>('/discussions/');
 
 export const getDiscussion = (id: number) => request<DiscussionDetail>(`/discussions/${id}`);
+export const getDiscussionByCode = (chatCode: string) => request<DiscussionDetail>(`/discussions/by-code/${chatCode}`);
 
 export const createDiscussion = (data: DiscussionCreate) =>
   request<DiscussionResponse>('/discussions/', {
@@ -48,6 +56,18 @@ export const resetDiscussion = (id: number) =>
 
 export const completeDiscussion = (id: number) =>
   request<DiscussionResponse>(`/discussions/${id}/complete`, { method: 'POST' });
+
+export const getDiscussionShare = (id: number) =>
+  request<{ active: boolean; share_code: string | null }>(`/discussions/${id}/share`);
+
+export const createDiscussionShare = (id: number) =>
+  request<{ active: boolean; share_code: string }>(`/discussions/${id}/share`, { method: 'POST' });
+
+export const revokeDiscussionShare = (id: number) =>
+  request<{ ok: boolean }>(`/discussions/${id}/share`, { method: 'DELETE' });
+
+export const getSharedDiscussion = (shareCode: string) =>
+  request<DiscussionDetail>(`/share/${shareCode}`);
 
 export const prepareAgents = (id: number) =>
   request<AgentConfigResponse[]>(`/discussions/${id}/prepare-agents`, { method: 'POST' });
@@ -175,6 +195,38 @@ export const getObserverHistory = (discussionId: number) =>
 export const clearObserverHistory = (discussionId: number) =>
   requestVoid(`/discussions/${discussionId}/observer/history`, { method: 'DELETE' });
 
+// --- Auth ---
+
+export const register = (email: string, password: string) =>
+  request<AuthStatusResponse>('/auth/register', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ email, password }),
+  });
+
+export const login = (email: string, password: string) =>
+  request<AuthStatusResponse>('/auth/login', {
+    method: 'POST',
+    headers: JSON_HEADERS,
+    body: JSON.stringify({ email, password }),
+  });
+
+export const logout = () => request<{ ok: boolean }>('/auth/logout', { method: 'POST' });
+
+export const me = () => request<AuthStatusResponse>('/auth/me');
+
+export const updateObserverMessage = (discussionId: number, messageId: number, content: string) =>
+  request<{ id: number; role: string; content: string; created_at: string }>(
+    `/discussions/${discussionId}/observer/messages/${messageId}`,
+    { method: 'PUT', headers: JSON_HEADERS, body: JSON.stringify({ content }) },
+  );
+
+export const truncateObserverMessagesAfter = (discussionId: number, messageId: number) =>
+  request<{ deleted_count: number }>(
+    `/discussions/${discussionId}/observer/messages/truncate-after`,
+    { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ message_id: messageId }) },
+  );
+
 // --- SSE Streaming helpers ---
 
 type SSECallback<T> = (event: T) => void;
@@ -189,7 +241,7 @@ function createSSEStream(
   completeTypes: string[],
 ): AbortController {
   const controller = new AbortController();
-  const init: RequestInit = { method, signal: controller.signal };
+  const init: RequestInit = { method, signal: controller.signal, credentials: 'include' };
   if (body !== undefined) {
     init.headers = JSON_HEADERS;
     init.body = JSON.stringify(body);

@@ -8,6 +8,7 @@ const STATUS_LABELS = {
   discussing: '讨论中',
   reflecting: '反思中',
   synthesizing: '总结中',
+  round_summary: '轮次总结中',
   completed: '已完成',
   failed: '失败',
 }
@@ -18,6 +19,7 @@ const STATUS_COLORS = {
   discussing: '#8b5cf6',
   reflecting: '#f59e0b',
   synthesizing: '#10b981',
+  round_summary: '#059669',
   completed: '#059669',
   failed: '#ef4444',
 }

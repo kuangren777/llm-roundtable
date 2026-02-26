@@ -43,6 +43,54 @@ async def clear_observer_history(db: AsyncSession, discussion_id: int) -> None:
     await db.commit()
 
 
+async def update_observer_user_message(
+    db: AsyncSession,
+    discussion_id: int,
+    message_id: int,
+    content: str,
+) -> ObserverMessage | None:
+    result = await db.execute(
+        select(ObserverMessage).where(
+            ObserverMessage.id == message_id,
+            ObserverMessage.discussion_id == discussion_id,
+            ObserverMessage.role == "user",
+        )
+    )
+    msg = result.scalar_one_or_none()
+    if not msg:
+        return None
+
+    msg.content = content
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+async def truncate_observer_messages_after(
+    db: AsyncSession,
+    discussion_id: int,
+    message_id: int,
+) -> int | None:
+    anchor_result = await db.execute(
+        select(ObserverMessage).where(
+            ObserverMessage.id == message_id,
+            ObserverMessage.discussion_id == discussion_id,
+        )
+    )
+    anchor = anchor_result.scalar_one_or_none()
+    if not anchor:
+        return None
+
+    delete_result = await db.execute(
+        delete(ObserverMessage).where(
+            ObserverMessage.discussion_id == discussion_id,
+            ObserverMessage.id > message_id,
+        )
+    )
+    await db.commit()
+    return int(delete_result.rowcount or 0)
+
+
 def _build_discussion_context(
     discussion: Discussion,
     messages: list[Message],
@@ -114,14 +162,34 @@ async def chat_with_observer(
         yield ObserverEvent(event_type="error", content="讨论不存在")
         return
 
-    # 2. Save user message
-    user_msg = ObserverMessage(
-        discussion_id=discussion_id, role="user", content=req.content,
-        created_at=datetime.now(timezone.utc),
-    )
-    db.add(user_msg)
-    await db.commit()
-    await db.refresh(user_msg)
+    # 2. Resolve current user message:
+    # - normal send: persist a new user message
+    # - resend after edit: reuse existing user message
+    user_msg: ObserverMessage | None = None
+    user_content = req.content
+    if req.reuse_message_id is not None:
+        user_msg_result = await db.execute(
+            select(ObserverMessage).where(
+                ObserverMessage.id == req.reuse_message_id,
+                ObserverMessage.discussion_id == discussion_id,
+                ObserverMessage.role == "user",
+            )
+        )
+        user_msg = user_msg_result.scalar_one_or_none()
+        if not user_msg:
+            yield ObserverEvent(event_type="error", content="要重发的用户消息不存在")
+            return
+        user_content = user_msg.content
+    else:
+        user_msg = ObserverMessage(
+            discussion_id=discussion_id,
+            role="user",
+            content=req.content,
+            created_at=datetime.now(timezone.utc),
+        )
+        db.add(user_msg)
+        await db.commit()
+        await db.refresh(user_msg)
 
     # 3. Build LLM messages
     context = _build_discussion_context(discussion, discussion.messages)
@@ -146,13 +214,13 @@ async def chat_with_observer(
     # Keep only recent turns to avoid prompt explosion.
     history_tail = observer_history[-OBSERVER_MAX_HISTORY_TURNS:]
     for om in history_tail:
-        if om.id == user_msg.id:
+        if user_msg and om.id == user_msg.id:
             continue
         llm_messages.append({
             "role": "user" if om.role == "user" else "assistant",
             "content": om.content,
         })
-    llm_messages.append({"role": "user", "content": req.content})
+    llm_messages.append({"role": "user", "content": user_content})
 
     # 4. Resolve LLM config
     config = await _resolve_llm_config(db, req)

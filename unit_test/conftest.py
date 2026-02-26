@@ -1,6 +1,7 @@
 """Shared test fixtures for unit tests."""
 import sys
 import os
+from contextlib import asynccontextmanager
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -27,6 +28,15 @@ async def override_get_db():
 app.dependency_overrides[get_db] = override_get_db
 
 
+@asynccontextmanager
+async def _test_lifespan(_app):
+    yield
+
+
+# Disable production startup hooks (init_db against real db) in tests.
+app.router.lifespan_context = _test_lifespan
+
+
 @pytest_asyncio.fixture(autouse=True)
 async def setup_db():
     """Create and tear down test database for each test."""
@@ -34,7 +44,9 @@ async def setup_db():
         os.remove(TEST_DB_PATH)
     sync_engine = create_engine(TEST_DB_URL.replace("sqlite+aiosqlite", "sqlite"), echo=False)
     Base.metadata.create_all(sync_engine)
+    sync_engine.dispose()
     yield
+    sync_engine = create_engine(TEST_DB_URL.replace("sqlite+aiosqlite", "sqlite"), echo=False)
     Base.metadata.drop_all(sync_engine)
     sync_engine.dispose()
     if os.path.exists(TEST_DB_PATH):
@@ -46,4 +58,10 @@ async def client():
     """Async HTTP client for testing FastAPI endpoints."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
+        # Default logged-in user for endpoints requiring auth.
+        res = await c.post(
+            "/api/auth/register",
+            json={"email": "tester@example.com", "password": "TestPass123!"},
+        )
+        assert res.status_code == 200
         yield c
