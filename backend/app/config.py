@@ -1,3 +1,4 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 import os
@@ -14,8 +15,16 @@ class Settings(BaseSettings):
     )
 
     database_url: str = f"sqlite+aiosqlite:///{_DB_PATH}"
-    host: str = "0.0.0.0"
-    port: int = 8000
+    host: str = Field(default="0.0.0.0", validation_alias=AliasChoices("HOST", "BACKEND_HOST"))
+    port: int = Field(default=8000, validation_alias=AliasChoices("BACKEND_PORT", "PORT"))
+    jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_days: int = 7
+    auth_cookie_name: str = "rt_session"
+    auth_cookie_secure: bool = False
+    auth_cookie_samesite: str = "lax"
+    seed_admin_email: str = "admin@example.com"
+    seed_admin_password: str = "ChangeMe123!"
 
 
 @lru_cache

@@ -5,8 +5,16 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BACKEND_PORT=8000
-FRONTEND_PORT=3214
+CONFIG_ENV="$PROJECT_ROOT/config/.env"
+if [ -f "$CONFIG_ENV" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$CONFIG_ENV"
+  set +a
+fi
+
+BACKEND_PORT="${BACKEND_PORT:-${PORT:-8000}}"
+FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 LOG_DIR="$PROJECT_ROOT/temp"
 mkdir -p "$LOG_DIR"
 
@@ -27,12 +35,34 @@ kill_by_port() {
     fi
 }
 
+kill_backend_processes() {
+    local pids
+    pids=$(pgrep -f "uvicorn backend.app.main:app --host 0.0.0.0 --port ${BACKEND_PORT}" || true)
+    if [ -n "$pids" ]; then
+        echo -e "  ${YELLOW}停止后端相关进程: $pids${NC}"
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 0.5
+    fi
+}
+
+kill_frontend_processes() {
+    local pids
+    pids=$(pgrep -f "vite --host 0.0.0.0 --port ${FRONTEND_PORT}" || true)
+    if [ -n "$pids" ]; then
+        echo -e "  ${YELLOW}停止前端相关进程: $pids${NC}"
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 0.5
+    fi
+}
+
 start_backend() {
     echo -e "${CYAN}[Backend]${NC} 停止旧进程..."
     kill_by_port $BACKEND_PORT
+    kill_backend_processes
 
     echo -e "${CYAN}[Backend]${NC} 启动 uvicorn :${BACKEND_PORT} ..."
     cd "$PROJECT_ROOT"
+    ulimit -n 65535 2>/dev/null || true
     nohup /home/bigdata/miniconda3/envs/agent/bin/python -m uvicorn backend.app.main:app \
         --host 0.0.0.0 --port $BACKEND_PORT --reload \
         > "$LOG_DIR/backend.log" 2>&1 &
@@ -50,6 +80,7 @@ start_backend() {
 start_frontend() {
     echo -e "${CYAN}[Frontend]${NC} 停止旧进程..."
     kill_by_port $FRONTEND_PORT
+    kill_frontend_processes
 
     echo -e "${CYAN}[Frontend]${NC} 启动 vite dev :${FRONTEND_PORT} ..."
     cd "$PROJECT_ROOT/frontend-new"
