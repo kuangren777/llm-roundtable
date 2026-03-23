@@ -1,75 +1,23 @@
-# CLAUDE.md
+# 项目专属指令
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+---
 
-## Commands
+## 一、项目协作流程
 
-```bash
-# Backend dev server (from project root)
-uvicorn backend.app.main:app --reload
+每次开始工作前，必须先阅读 shared_claude 文件夹中的全部内容，了解当前项目的整体状况、进行中的任务、以及其他 claude 实例已经完成或正在进行的工作。这一步不可跳过，因为项目经常有多个 claude 实例交替工作，不读上下文就动手极易产生冲突或重复劳动。
 
-# Frontend dev server (port 3000, proxies /api → localhost:8000)
-cd frontend && npm run dev
+完成自己的工作之后，必须将本次所做的修改、当前项目状况、遗留问题等信息更新到 shared_claude 文件夹中，这一步完成才算工作真正结束。同时，shared_claude 目录下维护一份 VERSIONS.md 文件，所有 TODO 项必须记录在此文件中，每完成一项就标记完成状态并写清楚具体改了什么、解决了什么问题，形成可追溯的版本变更记录。
 
-# Run all tests
-python -m pytest unit_test/ -v
+---
 
-# Run single test file
-python -m pytest unit_test/test_api.py -v
+## 二、Windows 脚本专项
 
-# Run single test
-python -m pytest unit_test/test_api.py::TestDiscussionEndpoints::test_create_discussion -v
+这一节的每条规则都来自实际 session 中反复踩坑的总结，不是理论建议。
 
-# Database migrations (must cd into backend/)
-cd backend && alembic upgrade head
-cd backend && alembic revision --autogenerate -m "description"
+bat 脚本中使用 conda activate 时，必须确保 activate 命令和后续的 python 命令在同一个 shell 上下文中执行。如果用 call conda activate 之后又启动了新的 cmd 子进程来运行 python，那么 conda 环境不会传递到子进程中，导致 import 失败或者用了错误的 python 版本。正确做法是在同一个脚本流程中依次执行 call conda activate envname 和 python xxx.py，中间不要切换进程上下文。
 
-# Full setup (install deps + build frontend)
-bash scripts/setup.sh
+嵌套引号的处理必须用转义字符（^" 或 \"），严禁混合使用单引号和双引号。Windows bat 不像 bash 那样区分单双引号的语义，混合使用会导致参数解析错误，而且这类错误的表现往往是静默的——脚本不会报错，但传入的参数值是错的。
 
-# Production frontend build → backend/static/
-cd frontend && npm run build
-```
+stop 脚本（用于停止服务进程）只能精确杀死目标进程，严禁使用宽泛的通配符匹配。历史上出现过因为 taskkill 的匹配模式过于宽泛，误杀了 explorer.exe 等系统进程的事故。正确做法是通过 PID 文件或者精确的进程名/窗口标题来定位目标进程。
 
-## Architecture
-
-Multi-agent discussion platform: multiple LLMs debate topics in structured rounds via an orchestrator-workers-critic pattern.
-
-**Tech stack:** FastAPI + LangGraph + LiteLLM (backend), React 18 + Vite (frontend), SQLite/aiosqlite + Alembic (DB)
-
-### Backend (`backend/app/`)
-
-**Request flow:** API routes → `discussion_service.py` (DB + orchestration) → `discussion_engine.py` (LangGraph workflow) → `llm_service.py` (LiteLLM calls)
-
-**LangGraph workflow** (5 nodes in `discussion_engine.py`):
-`host_planning` → `panelist_discussion` → `critic` → `should_continue_or_synthesize` (conditional: loop back or → `synthesis`)
-
-- `progress_queue_var` (ContextVar) passes an `asyncio.Queue` into LangGraph nodes for streaming progress events without polluting the TypedDict state
-- `_pending_user_messages` dict enables non-blocking user message injection mid-discussion
-- Round counting controls iteration (no VERDICT mechanism)
-
-**Discussion modes** (in `mode_templates.py`): Auto (LLM planner generates agents), Debate, Brainstorm, Sequential, Custom. Non-custom modes auto-generate agents from templates with round-robin LLM assignment.
-
-**SSE streaming:** `run_discussion()` runs the graph in `asyncio.create_task`, merges progress + node events via `asyncio.Queue`, yields SSE events. Frontend uses `fetch + ReadableStream` (not EventSource — POST endpoint).
-
-**Data model:** `LLMProvider` (1) → `LLMModel` (N) normalized structure. `discussion.llm_configs` JSON is a runtime snapshot. `DiscussionMaterial.discussion_id` nullable: NULL = library item, int = discussion-scoped.
-
-### Frontend (`frontend/src/`)
-
-- State-driven SPA (no router used despite react-router-dom being installed)
-- `App.jsx`: sidebar (history + settings) + main panel
-- `api.js`: all API calls + POST-based SSE via `fetch + ReadableStream`
-- Vite dev server on port 3000 proxies `/api` to `http://localhost:8000`
-
-## Key Conventions
-
-- **Pydantic V2** — use `model_config = ConfigDict(...)`, never `class Config`
-- **Async SQLAlchemy** — all DB access via `async_session`, use `selectinload()` for relationships
-- **SQLAlchemy reserved names** — `metadata` is reserved on `DeclarativeBase`; the project uses `meta_info` instead
-- **LLM base_url** — `_normalize_base_url()` in `llm_service.py` auto-appends `/v1` to bare-domain URLs
-- **SSE disconnect** — `run_discussion()` has a `finally` block resetting stuck statuses to FAILED (`GeneratorExit` is `BaseException`)
-- **Tests** — all under `unit_test/`, shared fixtures in `conftest.py` (in-memory SQLite), `asyncio_mode = "auto"` in `pyproject.toml`
-- **UI language** — Chinese (zh-CN)
-- **Alembic migrations** — run from `backend/` dir; `env.py` imports all models explicitly and overrides URL from settings
-- **Config** — `config/.env` (not project root), DB file `debate.db` at project root
-- **Uploads** — `backend/uploads/{discussion_id}/` for discussion files, `backend/uploads/library/` for library items
+日志重定向统一使用 >> logfile 2>&1 的方式追加写入日志文件，不要重定向到 nul，也不要用 > 覆盖写入（会丢失历史日志）。日志是排查问题的关键依据。
