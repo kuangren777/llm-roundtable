@@ -496,6 +496,9 @@ export default function App() {
   const summarizeAutoBlockUntilRef = useRef(0);
   const summarizeRunningCooldownRef = useRef(0);
   const toastTimerRef = useRef<number | null>(null);
+  const llmProgressBufferRef = useRef<Record<string, any>>({});
+  const streamingContentBufferRef = useRef<Record<string, string>>({});
+  const throttleTimerRef = useRef<number | null>(null);
   const chatCodeFromRoute = useMemo(() => extractChatCode(routePath), [routePath]);
   const shareCodeFromRoute = useMemo(() => extractShareCode(routePath), [routePath]);
   const isLoginRoute = routePath === '/login';
@@ -680,6 +683,28 @@ export default function App() {
   }, [observerMessages, observerStreamText]);
 
   // Polling for already-running discussions
+  const flushLlmBuffers = useCallback(() => {
+    const progressBuf = llmProgressBufferRef.current;
+    const contentBuf = streamingContentBufferRef.current;
+    if (Object.keys(progressBuf).length > 0) {
+      setLlmProgress(prev => {
+        const next = { ...prev, ...progressBuf };
+        if (activeId) persistLiveState(activeId, { llmProgress: next });
+        return next;
+      });
+    }
+    if (Object.keys(contentBuf).length > 0) {
+      setStreamingContent(prev => {
+        const next = { ...prev, ...contentBuf };
+        if (activeId) persistLiveState(activeId, { streamingContent: next });
+        return next;
+      });
+    }
+    llmProgressBufferRef.current = {};
+    streamingContentBufferRef.current = {};
+    throttleTimerRef.current = null;
+  }, [activeId, persistLiveState]);
+
   const startPolling = useCallback(() => {
     if (pollRef.current || !activeId) return;
     pollRef.current = setInterval(async () => {
@@ -879,25 +904,17 @@ export default function App() {
           }
         }
         if (event.event_type === 'llm_progress') {
-          setLlmProgress(prev => {
-            const prevEntry = prev?.[event.agent_name!];
-            const next = {
-              ...prev,
-              [event.agent_name!]: {
-                chars: event.chars_received || 0,
-                status: event.llm_status || '',
-                phase: event.phase || prevEntry?.phase || phase,
-              },
-            };
-            persistLiveState(activeId, { llmProgress: next });
-            return next;
-          });
+          const prevEntry = llmProgressBufferRef.current[event.agent_name!] || {};
+          llmProgressBufferRef.current[event.agent_name!] = {
+            chars: event.chars_received || 0,
+            status: event.llm_status || '',
+            phase: event.phase || prevEntry.phase || phase,
+          };
           if (event.content && event.phase !== 'round_summary') {
-            setStreamingContent(prev => {
-              const next = { ...prev, [event.agent_name!]: event.content! };
-              persistLiveState(activeId, { streamingContent: next });
-              return next;
-            });
+            streamingContentBufferRef.current[event.agent_name!] = event.content!;
+          }
+          if (throttleTimerRef.current === null) {
+            throttleTimerRef.current = window.setTimeout(flushLlmBuffers, 100);
           }
         }
       },
@@ -927,7 +944,7 @@ export default function App() {
       options,
     );
     streamRef.current = controller;
-  }, [activeId, phase, persistLiveState, removeLiveState, refreshList]);
+  }, [activeId, phase, persistLiveState, removeLiveState, refreshList, flushLlmBuffers]);
 
   // Auto-reattach live stream for running discussions (supports tab switch / refresh recovery).
   useEffect(() => {
