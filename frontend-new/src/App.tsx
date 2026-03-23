@@ -55,6 +55,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { NewDebateModal } from './components/NewDebateModal';
 import { AgentConfigModal } from './components/AgentConfigModal';
 import { ModelAvatar } from './components/ModelAvatar';
+import { MessageList } from './components/MessageList';
 import { copyTextWithFallback } from './utils/clipboard';
 import 'highlight.js/styles/github-dark.css';
 
@@ -1991,120 +1992,24 @@ export default function App() {
             )}
 
             {/* Messages */}
-            <AnimatePresence mode="popLayout">
-              {displayMessages.map((msg, idx) => (
-                <motion.div key={msg.id || idx} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className={`flex gap-3 group ${msg.agent_role === 'user' ? 'flex-row-reverse' : ''}`}>
-                  <div className="flex flex-col items-center pt-1 shrink-0">
-                    <ModelAvatar provider={agents.find(a => a.name === msg.agent_name)?.provider} className="w-8 h-8" />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className={`glass-card rounded-xl p-4 shadow-sm relative group-hover:shadow-md transition-all duration-300 ${
-                      msg.agent_role === 'user' ? 'rounded-tr-none' : 'rounded-tl-none'} ${
-                      msg.agent_role === 'host' ? 'border-l-4 border-l-blue-500' : ''
-                    }`}>
-                      <div className="flex items-center justify-between mb-2 border-b border-slate-100 dark:border-slate-700/50 pb-2">
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-slate-900 dark:text-white text-sm">{msg.agent_name}</span>
-                          <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide ${
-                            msg.agent_role === 'host' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300' :
-                            msg.agent_role === 'critic' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300' :
-                            msg.agent_role === 'user' ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300' :
-                            'bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300'
-                          }`}>{msg.agent_role}</span>
-                          {msg.phase && <span className="text-[9px] text-slate-400">{PHASE_LABELS[msg.phase] || msg.phase}</span>}
-                        </div>
-                        <div className="flex items-center text-[10px] text-slate-400 gap-3 font-mono">
-                          {msg.created_at && <span className="flex items-center gap-1"><Timer className="w-3 h-3" /> {formatTime(msg.created_at)}</span>}
-                          {msg.round_number !== undefined && <span className="flex items-center gap-1"><RefreshCw className="w-3 h-3" /> R{msg.round_number + 1}</span>}
-                        </div>
-                      </div>
-                      <div className="relative">
-                        {msg.agent_role === 'user' ? (
-                          editingMsgIdx === idx ? (
-                            <div className="flex flex-col gap-2">
-                              <textarea value={editingContent} onChange={e => setEditingContent(e.target.value)}
-                                className="w-full p-3 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-sm text-slate-900 dark:text-white resize-y min-h-[160px]"
-                                rows={7}
-                                autoFocus />
-                              <div className="flex gap-2 justify-end">
-                                <button onClick={() => setEditingMsgIdx(null)} className="px-2 py-1 text-xs text-slate-500 hover:text-slate-700 dark:hover:text-slate-300"><X className="w-3 h-3" /></button>
-                                <button
-                                  onClick={() => { void handleSaveEditedUserMessage(msg, idx); }}
-                                  className="px-2 py-1 text-xs text-emerald-600 hover:text-emerald-700 dark:text-emerald-400"
-                                >
-                                  <Check className="w-3 h-3" />
-                                </button>
-                              </div>
-                            </div>
-                          ) : <MarkdownRenderer content={msg.content} />
-                        ) : msg.summary || (msg.id && streamingSummaries[msg.id]) ? (
-                          <>
-                            <MarkdownRenderer content={msg.summary || (msg.id ? streamingSummaries[msg.id] || '' : '')} />
-                            {!msg.summary && msg.id && streamingSummaries[msg.id] && (
-                              <div className="mt-2 text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
-                                <Loader2 className="w-3 h-3 animate-spin" />
-                                总结中{summarizingMsgId === msg.id ? ` · ${summaryProgress || ''}` : ''}
-                              </div>
-                            )}
-                            <button onClick={() => openSummary(msg.content, `Full message by ${msg.agent_name}`)}
-                              className="mt-2 text-violet-600 dark:text-violet-400 text-xs hover:underline flex items-center gap-1">
-                              <Maximize2 className="w-3 h-3" /> View full
-                            </button>
-                          </>
-                        ) : ['synthesizing', 'round_summary'].includes(msg.phase || '') ? (
-                          <MarkdownRenderer content={msg.content} />
-                        ) : summarizingMsgId === msg.id ? (
-                          <div className="text-[11px] text-emerald-600 dark:text-emerald-300 inline-flex items-center gap-1.5">
-                            <Loader2 className="w-3 h-3 animate-spin" />
-                            总结中 · {summaryProgress || '准备中...'}
-                          </div>
-                        ) : (
-                          <button onClick={() => openSummary(msg.content, `${msg.agent_name} — ${PHASE_LABELS[msg.phase || ''] || msg.phase}`)}
-                            className="text-slate-500 dark:text-slate-400 text-xs hover:text-violet-600 dark:hover:text-violet-400 flex items-center gap-1">
-                            <Maximize2 className="w-3 h-3" /> {msg.content.length >= 1000 ? `${(msg.content.length / 1000).toFixed(1)}k` : msg.content.length} 字符 · 点击查看
-                          </button>
-                        )}
-                      </div>
-                      <div className="absolute -bottom-3 right-6 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                        {msg.agent_role === 'user' && (
-                          <button onClick={() => { setEditingMsgIdx(idx); setEditingContent(msg.content); }}
-                            className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-emerald-500 hover:scale-110 transition" title="Edit">
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                        )}
-                        <button onClick={() => { void copyToClipboard(msg.content); }}
-                          className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-blue-500 hover:scale-110 transition" title="Copy">
-                          <Copy className="w-3 h-3" />
-                        </button>
-                        {msg.id && msg.agent_role !== 'user' && (
-                          <button onClick={() => { if (activeId && msg.id) deleteMessage(activeId, msg.id).then(() => setMessages(prev => prev.filter(m => m.id !== msg.id))); }}
-                            className="p-1.5 bg-white dark:bg-slate-700 rounded-full shadow-md text-slate-400 hover:text-red-500 hover:scale-110 transition" title="Delete">
-                            <Trash2 className="w-3 h-3" />
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                </motion.div>
-              ))}
-            </AnimatePresence>
-
-            {Object.entries(streamingContent).map(([agentName, content]) => (
-              <motion.div key={`stream-${agentName}`} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="flex gap-3">
-                <div className="flex flex-col items-center pt-1 shrink-0">
-                  <ModelAvatar provider={agents.find(a => a.name === agentName)?.provider} className="w-8 h-8" />
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="glass-card rounded-xl rounded-tl-none p-4 shadow-sm border-l-4 border-l-emerald-500">
-                    <div className="flex items-center gap-2 mb-2 border-b border-slate-100 dark:border-slate-700/50 pb-2">
-                      <span className="font-bold text-slate-900 dark:text-white text-sm">{agentName}</span>
-                      <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase tracking-wide bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300">streaming</span>
-                    </div>
-                    <MarkdownRenderer content={content} />
-                  </div>
-                </div>
-              </motion.div>
-            ))}
+            <MessageList
+              messages={displayMessages}
+              agents={agents}
+              streamingContent={streamingContent}
+              streamingSummaries={streamingSummaries}
+              summarizingMsgId={summarizingMsgId}
+              summaryProgress={summaryProgress}
+              editingMsgIdx={editingMsgIdx}
+              editingContent={editingContent}
+              activeId={activeId}
+              onOpenSummary={openSummary}
+              onCopy={copyToClipboard}
+              onDelete={(msgId) => { if (activeId) deleteMessage(activeId, msgId).then(() => setMessages(prev => prev.filter(m => m.id !== msgId))); }}
+              onEditStart={(idx, content) => { setEditingMsgIdx(idx); setEditingContent(content); }}
+              onEditCancel={() => setEditingMsgIdx(null)}
+              onEditContentChange={setEditingContent}
+              onEditSave={(msg, idx) => { void handleSaveEditedUserMessage(msg, idx); }}
+            />
 
             {/* Live per-agent progress */}
             {discStatus === 'running' && agentProgressRows.length > 0 && (
