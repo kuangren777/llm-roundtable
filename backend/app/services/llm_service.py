@@ -5,14 +5,14 @@ We just pass them through to the openai SDK.
 """
 import asyncio
 import inspect
-import logging
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from typing import Optional
 
 from ..config import get_settings
+from ..logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 MAX_RETRIES = 10
 BASE_DELAY = 1.0  # seconds

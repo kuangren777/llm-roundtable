@@ -12,3 +12,4 @@ aiosqlite==0.20.0
 httpx>=0.23.0,<0.28.0
 websockets==14.1
 pytest-cov
+structlog

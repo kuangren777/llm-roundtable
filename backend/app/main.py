@@ -16,6 +16,7 @@ from .api.settings import router as settings_router
 from .api.share import router as share_router
 from .config import DEFAULT_JWT_SECRET, get_settings
 from .database import init_db
+from .logging_config import setup_logging
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 settings = get_settings()
@@ -28,6 +29,7 @@ async def lifespan(app: FastAPI):
             "JWT_SECRET_KEY is using the default insecure value. "
             "Set JWT_SECRET_KEY to a secure random string before starting the server."
         )
+    setup_logging()
     await init_db()
     yield
 

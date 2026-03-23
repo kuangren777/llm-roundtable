@@ -2,7 +2,6 @@
 import asyncio
 import contextlib
 import json
-import logging
 import os
 import secrets
 import shutil
@@ -14,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, update
 from sqlalchemy.orm import selectinload
 from fastapi import UploadFile
+
+from ..logging_config import get_logger
+logger = get_logger(__name__)
 
 from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole, SystemSetting, DiscussionShare, User
 from ..schemas.schemas import DiscussionCreate, AgentConfigUpdate, DiscussionEvent
@@ -29,8 +31,6 @@ from .discussion_engine import (
 from .mode_templates import get_mode_template, assign_llms_to_agents
 from .planner import plan_agents
 from .llm_service import call_llm, call_llm_stream
-
-logger = logging.getLogger(__name__)
 
 GRAPH_EVENT = "graph_event"
 PROGRESS_EVENT = "progress_event"
