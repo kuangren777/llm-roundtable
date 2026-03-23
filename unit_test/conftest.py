@@ -68,7 +68,10 @@ async def setup_db():
 
     app.dependency_overrides.pop(get_db, None)
     await test_engine.dispose()
-    temp_dir.cleanup()
+    try:
+        temp_dir.cleanup()
+    except PermissionError:
+        pass  # Windows: SQLite file may still be locked by background tasks
 
 
 @pytest_asyncio.fixture

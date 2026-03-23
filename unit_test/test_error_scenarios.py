@@ -33,7 +33,7 @@ async def test_invalid_discussion_id_returns_404(client):
 
 @pytest.mark.asyncio
 async def test_llm_timeout_error_handling(client, monkeypatch):
-    """mock LLM 抛出 TimeoutError，验证 SSE 流中有错误事件或讨论状态变为 error。"""
+    """mock LLM 抛出 TimeoutError，验证系统降级并回到 waiting_input。"""
     async def fake_call_timeout(agent, messages, phase="", stream_content=False, **kwargs):
         raise TimeoutError("LLM request timed out")
 
@@ -53,14 +53,15 @@ async def test_llm_timeout_error_handling(client, monkeypatch):
             if payload:
                 events.append(json.loads(payload))
 
-    # 验证：要么有 error 事件，要么讨论状态变为 failed/error
-    has_error_event = any(e.get("event_type") == "error" for e in events)
-    if not has_error_event:
-        detail_res = await client.get(f"/api/discussions/{discussion_id}")
-        assert detail_res.status_code == 200
-        status = detail_res.json()["status"]
-        assert status in ("failed", "error"), \
-            f"LLM 超时后讨论状态应为 failed 或 error，实际: {status}"
+    assert any(
+        e.get("event_type") == "message" and "[Error: LLM request timed out]" in e.get("content", "")
+        for e in events
+    )
+    assert any(e.get("event_type") == "cycle_complete" for e in events)
+
+    detail_res = await client.get(f"/api/discussions/{discussion_id}")
+    assert detail_res.status_code == 200
+    assert detail_res.json()["status"] == "waiting_input"
 
 
 @pytest.mark.asyncio

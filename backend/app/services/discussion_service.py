@@ -293,10 +293,14 @@ async def _stream_running_discussion_events(
             await _remove_live_subscriber(discussion_id, q)
 
 
-async def _get_summary_model_config() -> dict | None:
-    """Read the summary_model system setting. Returns dict with provider/model/api_key/base_url or None."""
-    async with async_session() as db:
-        result = await db.execute(
+async def _get_summary_model_config(db: AsyncSession | None = None) -> dict | None:
+    """Read the summary_model system setting. Returns dict with provider/model/api_key/base_url or None.
+
+    If db is provided, uses that session (e.g. in request context / tests).
+    Otherwise opens a new session from the module-level async_session factory.
+    """
+    async def _query(session: AsyncSession) -> dict | None:
+        result = await session.execute(
             select(SystemSetting).where(SystemSetting.key == "summary_model")
         )
         setting = result.scalar_one_or_none()
@@ -319,7 +323,7 @@ async def _get_summary_model_config() -> dict | None:
             except ValueError:
                 provider_id = None
         if provider_id:
-            prov_result = await db.execute(
+            prov_result = await session.execute(
                 select(LLMProvider).where(LLMProvider.id == provider_id)
             )
             prov = prov_result.scalar_one_or_none()
@@ -328,6 +332,11 @@ async def _get_summary_model_config() -> dict | None:
                 cfg["base_url"] = prov.base_url
                 cfg["provider"] = prov.provider
         return cfg
+
+    if db is not None:
+        return await _query(db)
+    async with async_session() as new_db:
+        return await _query(new_db)
 
 
 async def _summarize_message_bg(message_id: int):
@@ -1790,7 +1799,7 @@ async def summarize_discussion_messages(db: AsyncSession, discussion_id: int) ->
         yield DiscussionEvent(event_type="summary_complete", content="没有需要总结的消息")
         return
 
-    cfg = await _get_summary_model_config()
+    cfg = await _get_summary_model_config(db)
     if not cfg:
         yield DiscussionEvent(event_type="error", content="未配置总结模型，请在设置中配置 Summary Model")
         return
