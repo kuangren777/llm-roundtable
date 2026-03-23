@@ -5,12 +5,14 @@ We just pass them through to the openai SDK.
 """
 import asyncio
 import inspect
+import time
 from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from typing import Optional
 
 from ..config import get_settings
 from ..logging_config import get_logger
+from ..metrics import LLM_CALL_COUNT, LLM_CALL_DURATION
 
 logger = get_logger(__name__)
 
@@ -77,6 +79,7 @@ async def call_llm(
             base_url=normalized_url,
             timeout=timeout,
         )
+        start_time = time.perf_counter()
 
         try:
             last_error = None
@@ -97,8 +100,10 @@ async def call_llm(
                                 f"Check that the base_url is correct (got: {base_url})."
                             )
                         logger.warning("Provider %s/%s returned raw string instead of ChatCompletion", provider, model)
+                        LLM_CALL_COUNT.labels(provider=provider, model=model, status="success").inc()
                         return response
 
+                    LLM_CALL_COUNT.labels(provider=provider, model=model, status="success").inc()
                     return response.choices[0].message.content
 
                 except Exception as e:
@@ -113,8 +118,10 @@ async def call_llm(
                     else:
                         logger.error("LLM call %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
 
+            LLM_CALL_COUNT.labels(provider=provider, model=model, status="error").inc()
             raise last_error
         finally:
+            LLM_CALL_DURATION.labels(provider=provider, model=model).observe(time.perf_counter() - start_time)
             await _close_client_quietly(client)
 
 
@@ -136,6 +143,7 @@ async def call_llm_stream(
             base_url=normalized_url,
             timeout=timeout,
         )
+        start_time = time.perf_counter()
 
         try:
             last_error = None
@@ -158,6 +166,7 @@ async def call_llm_stream(
                             if on_chunk:
                                 await on_chunk(delta, total_chars)
 
+                    LLM_CALL_COUNT.labels(provider=provider, model=model, status="success").inc()
                     return "".join(chunks), total_chars
 
                 except Exception as e:
@@ -172,6 +181,8 @@ async def call_llm_stream(
                     else:
                         logger.error("LLM stream %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
 
+            LLM_CALL_COUNT.labels(provider=provider, model=model, status="error").inc()
             raise last_error
         finally:
+            LLM_CALL_DURATION.labels(provider=provider, model=model).observe(time.perf_counter() - start_time)
             await _close_client_quietly(client)

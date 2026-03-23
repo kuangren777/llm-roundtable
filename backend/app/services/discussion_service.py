@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 from ..models.models import Discussion, AgentConfig, Message, LLMProvider, LLMModel, DiscussionMaterial, DiscussionStatus, DiscussionMode, AgentRole, SystemSetting, DiscussionShare, User
 from ..schemas.schemas import DiscussionCreate, AgentConfigUpdate, DiscussionEvent
 from ..database import async_session
+from ..metrics import ACTIVE_DISCUSSIONS
 from .discussion_engine import (
     build_discussion_graph,
     AgentInfo,
@@ -1088,6 +1089,7 @@ async def run_discussion(
     force_single_round: bool | None = None,
 ) -> AsyncGenerator[DiscussionEvent, None]:
     """Run the discussion and yield SSE events."""
+    ACTIVE_DISCUSSIONS.inc()
     discussion = await get_discussion(db, discussion_id)
     if not discussion:
         event = DiscussionEvent(event_type="error", content="Discussion not found")
@@ -1486,6 +1488,7 @@ async def run_discussion(
         await _broadcast_discussion_event(discussion_id, event)
         yield event
     finally:
+        ACTIVE_DISCUSSIONS.dec()
         await _clear_pending_user_messages(discussion_id)
         progress_queue_var.reset(token)
 

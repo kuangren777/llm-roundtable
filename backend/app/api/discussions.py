@@ -26,6 +26,7 @@ from ..schemas.schemas import (
 from ..services.auth_service import get_current_user
 from ..config import get_settings
 from ..services.security import decode_access_token
+from ..metrics import SSE_CONNECTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,7 @@ async def run_discussion_endpoint(
         stream_session_factory = async_sessionmaker(auth_db.bind, class_=AsyncSession, expire_on_commit=False)
 
     async def event_stream():
+        SSE_CONNECTIONS.inc()
         async with stream_session_factory() as stream_db:
             try:
                 async for event in run_discussion(stream_db, discussion_id, force_single_round=single_round):
@@ -215,6 +217,7 @@ async def run_discussion_endpoint(
             except Exception as e:
                 logger.warning("SSE stream error for discussion %d: %s", discussion_id, e)
             finally:
+                SSE_CONNECTIONS.dec()
                 logger.info("SSE stream closed for discussion %d", discussion_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
