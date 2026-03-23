@@ -15,7 +15,7 @@ interface AgentConfigModalProps {
   onCopy?: (text: string) => void | Promise<void>;
 }
 
-export function AgentConfigModal({ isOpen, onClose, agent, discussionId, onSave, providers, onCopy }: AgentConfigModalProps) {
+export const AgentConfigModal = React.memo(function AgentConfigModal({ isOpen, onClose, agent, discussionId, onSave, providers, onCopy }: AgentConfigModalProps) {
   const [name, setName] = useState('');
   const [persona, setPersona] = useState('');
   const [selectedProviderId, setSelectedProviderId] = useState<number | null>(null);
@@ -175,4 +175,4 @@ export function AgentConfigModal({ isOpen, onClose, agent, discussionId, onSave,
       </motion.div>
     </div>
   );
-}
+}, (prev, next) => prev.isOpen === next.isOpen && prev.agent?.id === next.agent?.id && prev.discussionId === next.discussionId);
