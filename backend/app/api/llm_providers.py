@@ -10,8 +10,13 @@ from ..schemas.schemas import (
     LLMProviderCreate, LLMProviderUpdate, LLMProviderResponse,
     LLMModelCreate, LLMModelUpdate, LLMModelResponse,
 )
+from ..services.auth_service import get_current_user
 
-router = APIRouter(prefix="/api/llm-providers", tags=["llm-providers"])
+router = APIRouter(
+    prefix="/api/llm-providers",
+    tags=["llm-providers"],
+    dependencies=[Depends(get_current_user)],
+)
 
 
 # --- Helper ---

@@ -1,26 +1,33 @@
 """FastAPI application entry point."""
-import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from .database import init_db
+from .api.auth import router as auth_router
 from .api.discussions import router as discussions_router
 from .api.llm_providers import router as llm_providers_router
-from .api.settings import router as settings_router
 from .api.materials import router as materials_router
 from .api.observer import router as observer_router
-from .api.auth import router as auth_router
+from .api.settings import router as settings_router
 from .api.share import router as share_router
+from .config import DEFAULT_JWT_SECRET, get_settings
+from .database import init_db
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
+settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if settings.jwt_secret_key == DEFAULT_JWT_SECRET:
+        raise RuntimeError(
+            "JWT_SECRET_KEY is using the default insecure value. "
+            "Set JWT_SECRET_KEY to a secure random string before starting the server."
+        )
     await init_db()
     yield
 
@@ -34,7 +41,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_allowed_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

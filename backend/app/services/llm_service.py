@@ -10,10 +10,13 @@ from urllib.parse import urlparse
 from openai import AsyncOpenAI
 from typing import Optional
 
+from ..config import get_settings
+
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 10
 BASE_DELAY = 1.0  # seconds
+_LLM_CALL_SEMAPHORE = asyncio.Semaphore(max(1, int(get_settings().llm_max_concurrency or 1)))
 
 # GPT series models: default reasoning_effort=high
 _GPT_MODEL_PREFIXES = ("gpt-", "o1", "o3", "o4", "chatgpt-")
@@ -67,51 +70,52 @@ async def call_llm(
     **kwargs,
 ) -> str:
     """Call an LLM via the OpenAI-compatible chat completions API with retry."""
-    normalized_url = _normalize_base_url(base_url)
-    client = AsyncOpenAI(
-        api_key=api_key or "sk-placeholder",
-        base_url=normalized_url,
-        timeout=timeout,
-    )
+    async with _LLM_CALL_SEMAPHORE:
+        normalized_url = _normalize_base_url(base_url)
+        client = AsyncOpenAI(
+            api_key=api_key or "sk-placeholder",
+            base_url=normalized_url,
+            timeout=timeout,
+        )
 
-    try:
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                create_kwargs = dict(model=model, messages=messages, temperature=temperature)
-                if _is_gpt_model(model):
-                    create_kwargs["reasoning_effort"] = "high"
-                if "max_tokens" in kwargs:
-                    create_kwargs["max_tokens"] = kwargs["max_tokens"]
-                response = await client.chat.completions.create(**create_kwargs)
+        try:
+            last_error = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    create_kwargs = dict(model=model, messages=messages, temperature=temperature)
+                    if _is_gpt_model(model):
+                        create_kwargs["reasoning_effort"] = "high"
+                    if "max_tokens" in kwargs:
+                        create_kwargs["max_tokens"] = kwargs["max_tokens"]
+                    response = await client.chat.completions.create(**create_kwargs)
 
-                # Some OpenAI-compatible endpoints return raw strings (e.g. HTML error pages)
-                if isinstance(response, str):
-                    if "<html" in response.lower() or "<!doctype" in response.lower():
-                        raise ValueError(
-                            f"Provider {provider}/{model} returned an HTML page instead of a JSON response. "
-                            f"Check that the base_url is correct (got: {base_url})."
+                    # Some OpenAI-compatible endpoints return raw strings (e.g. HTML error pages)
+                    if isinstance(response, str):
+                        if "<html" in response.lower() or "<!doctype" in response.lower():
+                            raise ValueError(
+                                f"Provider {provider}/{model} returned an HTML page instead of a JSON response. "
+                                f"Check that the base_url is correct (got: {base_url})."
+                            )
+                        logger.warning("Provider %s/%s returned raw string instead of ChatCompletion", provider, model)
+                        return response
+
+                    return response.choices[0].message.content
+
+                except Exception as e:
+                    last_error = e
+                    if attempt < MAX_RETRIES - 1:
+                        delay = BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "LLM call %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                            provider, model, attempt + 1, MAX_RETRIES, e, delay,
                         )
-                    logger.warning("Provider %s/%s returned raw string instead of ChatCompletion", provider, model)
-                    return response
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error("LLM call %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
 
-                return response.choices[0].message.content
-
-            except Exception as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "LLM call %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
-                        provider, model, attempt + 1, MAX_RETRIES, e, delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("LLM call %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
-
-        raise last_error
-    finally:
-        await _close_client_quietly(client)
+            raise last_error
+        finally:
+            await _close_client_quietly(client)
 
 
 async def call_llm_stream(
@@ -125,48 +129,49 @@ async def call_llm_stream(
     timeout: float = 180,
 ) -> tuple[str, int]:
     """Streaming LLM call with retry + on_chunk progress callback. Returns (full_text, total_chars)."""
-    normalized_url = _normalize_base_url(base_url)
-    client = AsyncOpenAI(
-        api_key=api_key or "sk-placeholder",
-        base_url=normalized_url,
-        timeout=timeout,
-    )
+    async with _LLM_CALL_SEMAPHORE:
+        normalized_url = _normalize_base_url(base_url)
+        client = AsyncOpenAI(
+            api_key=api_key or "sk-placeholder",
+            base_url=normalized_url,
+            timeout=timeout,
+        )
 
-    try:
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                create_kwargs = dict(model=model, messages=messages, stream=True, temperature=temperature)
-                if _is_gpt_model(model):
-                    create_kwargs["reasoning_effort"] = "high"
-                stream = await client.chat.completions.create(**create_kwargs)
+        try:
+            last_error = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    create_kwargs = dict(model=model, messages=messages, stream=True, temperature=temperature)
+                    if _is_gpt_model(model):
+                        create_kwargs["reasoning_effort"] = "high"
+                    stream = await client.chat.completions.create(**create_kwargs)
 
-                chunks = []
-                total_chars = 0
-                async for chunk in stream:
-                    if not chunk.choices:
-                        continue
-                    delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
-                    if delta:
-                        chunks.append(delta)
-                        total_chars += len(delta)
-                        if on_chunk:
-                            await on_chunk(delta, total_chars)
+                    chunks = []
+                    total_chars = 0
+                    async for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
+                        if delta:
+                            chunks.append(delta)
+                            total_chars += len(delta)
+                            if on_chunk:
+                                await on_chunk(delta, total_chars)
 
-                return "".join(chunks), total_chars
+                    return "".join(chunks), total_chars
 
-            except Exception as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = BASE_DELAY * (2 ** attempt)
-                    logger.warning(
-                        "LLM stream %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
-                        provider, model, attempt + 1, MAX_RETRIES, e, delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    logger.error("LLM stream %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
+                except Exception as e:
+                    last_error = e
+                    if attempt < MAX_RETRIES - 1:
+                        delay = BASE_DELAY * (2 ** attempt)
+                        logger.warning(
+                            "LLM stream %s/%s failed (attempt %d/%d): %s — retrying in %.1fs",
+                            provider, model, attempt + 1, MAX_RETRIES, e, delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error("LLM stream %s/%s failed after %d attempts: %s", provider, model, MAX_RETRIES, e)
 
-        raise last_error
-    finally:
-        await _close_client_quietly(client)
+            raise last_error
+        finally:
+            await _close_client_quietly(client)
