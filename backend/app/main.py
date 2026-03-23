@@ -1,11 +1,14 @@
 """FastAPI application entry point."""
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import Request as StarletteRequest
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 
 from .api.auth import router as auth_router
 from .api.discussions import router as discussions_router
@@ -17,6 +20,7 @@ from .api.share import router as share_router
 from .config import DEFAULT_JWT_SECRET, get_settings
 from .database import init_db
 from .logging_config import setup_logging
+from .metrics import HTTP_REQUEST_COUNT, HTTP_REQUEST_DURATION
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 settings = get_settings()
@@ -41,6 +45,26 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+@app.middleware("http")
+async def metrics_middleware(request: StarletteRequest, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    endpoint = request.url.path
+    if not endpoint.startswith("/metrics"):
+        HTTP_REQUEST_COUNT.labels(
+            method=request.method,
+            endpoint=endpoint,
+            status_code=response.status_code,
+        ).inc()
+        HTTP_REQUEST_DURATION.labels(
+            method=request.method,
+            endpoint=endpoint,
+        ).observe(duration)
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_allowed_origins_list,
@@ -61,6 +85,11 @@ app.include_router(share_router)
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # Serve built frontend in production (when backend/static/ exists)
