@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useCallback } from 'react';
 import { VariableSizeList as List } from 'react-window';
+import type { ListChildComponentProps } from 'react-window';
 import { motion } from 'motion/react';
 import { Loader2 } from 'lucide-react';
 import { ModelAvatar } from './ModelAvatar';
@@ -8,6 +9,7 @@ import type { MessageResponse, AgentConfigResponse } from '../types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
+import { isNearBottom as checkNearBottom, shouldAutoScrollToBottom } from './messageListScroll';
 
 // Estimate row height based on content length
 function estimateHeight(msg: MessageResponse): number {
@@ -60,6 +62,8 @@ export const MessageList = React.memo(function MessageList({
   const containerRef = useRef<HTMLDivElement>(null);
   const heightCacheRef = useRef<Record<number, number>>({});
   const prevMessagesLenRef = useRef(0);
+  const isNearBottomRef = useRef(true);
+  const prevStreamingSignatureRef = useRef('');
 
   const getItemSize = useCallback((index: number) => {
     if (heightCacheRef.current[index] !== undefined) {
@@ -72,13 +76,27 @@ export const MessageList = React.memo(function MessageList({
     return h;
   }, [messages]);
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll only when the real virtual list scroller is near the bottom.
   useEffect(() => {
-    if (messages.length > prevMessagesLenRef.current && listRef.current) {
+    const messageCountChanged = messages.length > prevMessagesLenRef.current;
+    const streamingSignature = JSON.stringify(streamingContent);
+    const streamingChanged = streamingSignature !== prevStreamingSignatureRef.current;
+
+    if (
+      listRef.current &&
+      messages.length > 0 &&
+      shouldAutoScrollToBottom({
+        isNearBottom: isNearBottomRef.current,
+        messageCountChanged,
+        streamingChanged,
+      })
+    ) {
       listRef.current.scrollToItem(messages.length - 1, 'end');
     }
+
     prevMessagesLenRef.current = messages.length;
-  }, [messages.length]);
+    prevStreamingSignatureRef.current = streamingSignature;
+  }, [messages.length, streamingContent]);
 
   // Reset height cache when messages change
   useEffect(() => {
@@ -90,7 +108,7 @@ export const MessageList = React.memo(function MessageList({
 
   const containerHeight = 600; // fallback; actual height comes from flex container
 
-  const Row = useCallback(({ index, style }: { index: number; style: React.CSSProperties }) => {
+  const Row = useCallback(({ index, style }: ListChildComponentProps) => {
     const msg = messages[index];
     if (!msg) return null;
     return (
@@ -128,6 +146,14 @@ export const MessageList = React.memo(function MessageList({
             itemCount={messages.length}
             getItemSize={getItemSize}
             Row={Row}
+            onScrollStateChange={({ scrollOffset, scrollHeight, clientHeight }) => {
+              isNearBottomRef.current = checkNearBottom({
+                scrollHeight,
+                scrollOffset,
+                clientHeight,
+                threshold: 140,
+              });
+            }}
           />
         </div>
       )}
@@ -163,13 +189,16 @@ function AutoSizedList({
   itemCount,
   getItemSize,
   Row,
+  onScrollStateChange,
 }: {
   listRef: React.RefObject<List | null>;
   itemCount: number;
   getItemSize: (index: number) => number;
-  Row: React.ComponentType<{ index: number; style: React.CSSProperties }>;
+  Row: React.ComponentType<ListChildComponentProps>;
+  onScrollStateChange: (state: { scrollOffset: number; scrollHeight: number; clientHeight: number }) => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const outerRef = useRef<HTMLDivElement>(null);
   const [height, setHeight] = React.useState(600);
 
   useEffect(() => {
@@ -193,6 +222,17 @@ function AutoSizedList({
         itemSize={getItemSize}
         width="100%"
         overscanCount={5}
+        outerRef={outerRef}
+        onScroll={({ scrollOffset }) => {
+          const outerEl = outerRef.current;
+          if (outerEl) {
+            onScrollStateChange({
+              scrollOffset,
+              scrollHeight: outerEl.scrollHeight,
+              clientHeight: outerEl.clientHeight,
+            });
+          }
+        }}
       >
         {Row}
       </List>

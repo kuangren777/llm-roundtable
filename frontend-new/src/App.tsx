@@ -484,9 +484,7 @@ export default function App() {
   const observerStreamRef = useRef<AbortController | null>(null);
   const observerTextRef = useRef('');
 
-  const scrollRef = useRef<HTMLDivElement>(null);
   const observerScrollRef = useRef<HTMLDivElement>(null);
-  const isMainNearBottomRef = useRef(true);
   const isObserverNearBottomRef = useRef(true);
   const liveStateRef = useRef<Record<number, LiveState>>({});
   const streamRef = useRef<AbortController | null>(null);
@@ -670,12 +668,6 @@ export default function App() {
     }
   }, [providers, observerConfig.providerId, observerConfig.provider, observerConfig.model]);
 
-  // Auto-scroll only when user is already near the bottom.
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (!el || !isMainNearBottomRef.current) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-  }, [messages, streamingContent, streamingSummaries]);
   useEffect(() => {
     const el = observerScrollRef.current;
     if (!el || !isObserverNearBottomRef.current) return;
@@ -736,7 +728,6 @@ export default function App() {
     summaryStreamRef.current = null;
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     observerStreamRef.current?.abort();
-    isMainNearBottomRef.current = true;
     isObserverNearBottomRef.current = true;
     summarizeAutoRef.current = false;
     setSummarizing(false);
@@ -1966,12 +1957,6 @@ export default function App() {
         </AnimatePresence>
 
         <div
-          ref={scrollRef}
-          onScroll={() => {
-            const el = scrollRef.current;
-            if (!el) return;
-            isMainNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
-          }}
           className="flex-1 overflow-y-auto px-4 py-4 scroll-smooth chat-container relative"
         >
           <div className="max-w-[850px] mx-auto space-y-4 pb-48">
