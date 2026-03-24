@@ -11,6 +11,9 @@ venv/
 dist/
 build/
 .eggs/
+.coverage
+.pytest_cache/
+htmlcov/
 
 # Node
 node_modules/
