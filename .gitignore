@@ -47,6 +47,7 @@ Thumbs.db
 
 # Claude
 .claude/
+.worktrees/
 
 # Shared work folder for multiple Claude instances
 shared_claude/
