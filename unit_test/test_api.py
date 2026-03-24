@@ -35,7 +35,7 @@ async def test_discussions_isolated_by_user_and_share_read_only(client):
     chat_code = discussion["chat_code"]
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as user2:
+    async with AsyncClient(transport=transport, base_url="https://test") as user2:
         reg_res = await user2.post(
             "/api/auth/register",
             json={"email": "user2@example.com", "password": "User2Pass123!"},
@@ -57,7 +57,7 @@ async def test_discussions_isolated_by_user_and_share_read_only(client):
     share_code = share_res.json()["share_code"]
 
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as user2:
+    async with AsyncClient(transport=transport, base_url="https://test") as user2:
         reg_res = await user2.post(
             "/api/auth/register",
             json={"email": "user2b@example.com", "password": "User2Pass123!"},
@@ -538,16 +538,13 @@ async def test_observer_history_empty(client):
 
 
 async def test_observer_chat_streams_error_for_missing_discussion(client):
-    """Observer chat on non-existent discussion should return error event."""
+    """Observer chat on non-existent discussion should return 404."""
     res = await client.post(
         "/api/discussions/9999/observer/chat",
         json={"content": "hello", "provider": "openai", "model": "gpt-4o"},
     )
-    # SSE endpoint returns 200 with error event in the stream
-    assert res.status_code == 200
-    body = res.text
-    assert "error" in body
-    assert "讨论不存在" in body
+    assert res.status_code == 404
+    assert res.json()["detail"] == "Discussion not found"
 
 
 async def test_clear_observer_history(client):

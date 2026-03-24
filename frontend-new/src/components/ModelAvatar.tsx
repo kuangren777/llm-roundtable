@@ -7,7 +7,7 @@ interface ModelAvatarProps {
   className?: string;
 }
 
-export function ModelAvatar({ provider, model, className = "w-8 h-8" }: ModelAvatarProps) {
+export const ModelAvatar = React.memo(function ModelAvatar({ provider, model, className = "w-8 h-8" }: ModelAvatarProps) {
   const getIcon = () => {
     switch (provider?.toLowerCase()) {
       case 'openai': return <Bot className="w-[60%] h-[60%]" />;
@@ -33,4 +33,4 @@ export function ModelAvatar({ provider, model, className = "w-8 h-8" }: ModelAva
       {getIcon()}
     </div>
   );
-}
+});

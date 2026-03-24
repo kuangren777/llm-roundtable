@@ -20,7 +20,7 @@ interface Props {
   onCreated?: (discussion: DiscussionResponse) => void;
 }
 
-export function NewDebateModal({ isOpen, onClose, onCreated }: Props) {
+export const NewDebateModal = React.memo(function NewDebateModal({ isOpen, onClose, onCreated }: Props) {
   // Step control
   const [step, setStep] = useState<1 | 2>(1);
 
@@ -246,7 +246,7 @@ export function NewDebateModal({ isOpen, onClose, onCreated }: Props) {
       </motion.div>
     </div>
   );
-}
+}, (prev, next) => prev.isOpen === next.isOpen);
 
 /* ── Step 1: Topic + Materials ── */
 

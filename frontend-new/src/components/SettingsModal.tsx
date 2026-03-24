@@ -39,7 +39,7 @@ function parseSummaryModelSetting(raw: unknown): { provider_id: number; provider
   }
 }
 
-export function SettingsModal({ isOpen, onClose, onProvidersChange }: Props) {
+export const SettingsModal = React.memo(function SettingsModal({ isOpen, onClose, onProvidersChange }: Props) {
   const [providers, setProviders] = useState<LLMProviderResponse[]>([]);
   const [activeTab, setActiveTab] = useState<'providers' | 'models'>('providers');
   const [loading, setLoading] = useState(false);
@@ -377,4 +377,4 @@ export function SettingsModal({ isOpen, onClose, onProvidersChange }: Props) {
       </motion.div>
     </div>
   );
-}
+}, (prev, next) => prev.isOpen === next.isOpen);

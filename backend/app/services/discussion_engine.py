@@ -10,6 +10,7 @@ import contextvars
 import json
 import re
 import uuid
+from collections import defaultdict
 from typing import TypedDict, Annotated, Optional
 from langgraph.graph import StateGraph, END
 from ..services.llm_service import call_llm, call_llm_stream
@@ -22,6 +23,12 @@ progress_queue_var: contextvars.ContextVar[asyncio.Queue | None] = contextvars.C
 
 # Per-discussion pending user messages (non-blocking injection)
 _pending_user_messages: dict[int, list[dict]] = {}
+_pending_user_message_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+async def pop_pending_user_messages(discussion_id: int) -> list[dict]:
+    async with _pending_user_message_locks[discussion_id]:
+        return _pending_user_messages.pop(discussion_id, [])
 
 HISTORY_MAX_CHARS = 50000
 HISTORY_HEAD_ROUNDS = 2
@@ -927,7 +934,7 @@ async def host_next_step_planning_node(state: DiscussionState) -> dict:
         return {"next_step_plan": "", "phase": "next_step_planning"}
 
     discussion_id = state.get("discussion_id", 0)
-    user_msgs = _pending_user_messages.pop(discussion_id, [])
+    user_msgs = await pop_pending_user_messages(discussion_id)
     injected_messages = []
     queue = progress_queue_var.get(None)
     for um in user_msgs:

@@ -11,6 +11,9 @@ venv/
 dist/
 build/
 .eggs/
+.coverage
+.pytest_cache/
+htmlcov/
 
 # Node
 node_modules/
@@ -47,3 +50,7 @@ Thumbs.db
 
 # Claude
 .claude/
+.worktrees/
+
+# Shared work folder for multiple Claude instances
+shared_claude/

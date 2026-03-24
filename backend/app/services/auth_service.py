@@ -15,6 +15,9 @@ from .security import (
     decode_access_token,
 )
 
+from ..logging_config import get_logger
+logger = get_logger(__name__)
+
 
 def _normalize_email(email: str) -> str:
     return email.strip().lower()

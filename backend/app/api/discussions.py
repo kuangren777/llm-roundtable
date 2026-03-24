@@ -2,9 +2,11 @@
 import json
 import logging
 from typing import List
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from contextlib import asynccontextmanager
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..database import get_db
 from ..models.models import User
@@ -22,6 +24,9 @@ from ..schemas.schemas import (
     TruncateMessagesResponse,
 )
 from ..services.auth_service import get_current_user
+from ..config import get_settings
+from ..services.security import decode_access_token
+from ..metrics import SSE_CONNECTIONS
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +78,35 @@ async def _get_owned_discussion_by_code_or_404(db: AsyncSession, chat_code: str,
     if not discussion or not _is_owner_or_admin(discussion, user):
         raise HTTPException(status_code=404, detail="Discussion not found")
     return discussion
+
+
+async def _get_request_user(request: Request, db: AsyncSession) -> User:
+    token = request.cookies.get(get_settings().auth_cookie_name)
+    if not token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    try:
+        payload = decode_access_token(token)
+        user_id = int(payload.get("sub"))
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+    return user
+
+
+@asynccontextmanager
+async def _open_request_scoped_db(request: Request):
+    override = request.app.dependency_overrides.get(get_db)
+    db_provider = override or get_db
+    db_gen = db_provider()
+    session = await anext(db_gen)
+    try:
+        yield session
+    finally:
+        await db_gen.aclose()
 
 
 @router.post("/", response_model=DiscussionResponse)
@@ -164,22 +198,27 @@ async def generate_title_endpoint(
 @router.post("/{discussion_id}/run")
 async def run_discussion_endpoint(
     discussion_id: int,
+    request: Request,
     single_round: bool | None = None,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ):
     """Run a discussion and stream events via SSE."""
-    await _get_owned_discussion_or_404(db, discussion_id, current_user)
+    async with _open_request_scoped_db(request) as auth_db:
+        current_user = await _get_request_user(request, auth_db)
+        await _get_owned_discussion_or_404(auth_db, discussion_id, current_user)
+        stream_session_factory = async_sessionmaker(auth_db.bind, class_=AsyncSession, expire_on_commit=False)
 
     async def event_stream():
-        try:
-            async for event in run_discussion(db, discussion_id, force_single_round=single_round):
-                data = event.model_dump_json()
-                yield f"data: {data}\n\n"
-        except Exception as e:
-            logger.warning("SSE stream error for discussion %d: %s", discussion_id, e)
-        finally:
-            logger.info("SSE stream closed for discussion %d", discussion_id)
+        SSE_CONNECTIONS.inc()
+        async with stream_session_factory() as stream_db:
+            try:
+                async for event in run_discussion(stream_db, discussion_id, force_single_round=single_round):
+                    data = event.model_dump_json()
+                    yield f"data: {data}\n\n"
+            except Exception as e:
+                logger.warning("SSE stream error for discussion %d: %s", discussion_id, e)
+            finally:
+                SSE_CONNECTIONS.dec()
+                logger.info("SSE stream closed for discussion %d", discussion_id)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
